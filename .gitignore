@@ -1,3 +1,10 @@
+# Artefatos gerados pelo compilador (arquivos de exemplo em exemplos/*.delegua devem ser versionados)
+exemplos/*.j
+exemplos/*.class
+
+# jasmin.jar é baixado localmente (ver README), não versionado
+ferramentas/
+
 # Logs
 logs
 *.log

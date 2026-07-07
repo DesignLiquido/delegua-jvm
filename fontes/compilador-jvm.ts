@@ -4,16 +4,19 @@ import {
     AvaliadorSintatico,
     Binario,
     Bloco,
+    Chamada,
     Continua,
     Declaracao,
     Enquanto,
     Escolha,
     Escreva,
     Expressao,
+    FuncaoDeclaracao,
     Lexador,
     Literal,
     Logico,
     Para,
+    Retorna,
     Se,
     Sustar,
     Unario,
@@ -50,6 +53,20 @@ interface VariavelLocal {
     tipoDelegua: string;
 }
 
+interface ParametroFuncao {
+    nome: string;
+    tipoDelegua: string;
+    tipoJvm: string;
+}
+
+interface FuncaoInfo {
+    nomeJvm: string;
+    parametros: ParametroFuncao[];
+    tipoRetornoDelegua: string;
+    tipoRetornoJvm: string;
+    descritor: string;
+}
+
 const MAPA_TIPOS_JVM: Record<string, string> = {
     inteiro: 'I',
     numero: 'D',
@@ -75,6 +92,10 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     // Rótulo de destino de `continua`/`sustar` no laço (ou `escolha`, só para `sustar`) mais interno.
     private pilhaContinua: string[];
     private pilhaSustar: string[];
+    private funcoes: Map<string, FuncaoInfo>;
+    private metodosGerados: string[];
+    // Tipo Delégua declarado para o `retorna` da função sendo compilada agora ('vazio' em `main`).
+    private tipoRetornoAtual: string;
 
     constructor() {
         super();
@@ -91,10 +112,28 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.proximoRotulo = 0;
         this.pilhaContinua = [];
         this.pilhaSustar = [];
+        this.funcoes = new Map();
+        this.metodosGerados = [];
+        this.tipoRetornoAtual = 'vazio';
 
         const retornoLexador = this.lexador.mapear(codigo, -1);
-        const retornoAvaliadorSintatico = await this.avaliadorSintatico.analisar(retornoLexador, -1);
+        const retornoAvaliadorSintatico: any = await this.avaliadorSintatico.analisar(retornoLexador, -1);
         const declaracoes = retornoAvaliadorSintatico.declaracoes as Declaracao[];
+
+        // `analisar()` não lança em erro de sintaxe: ele descarta a declaração problemática
+        // de `declaracoes` (silenciosamente) e só reporta o problema em `erros`. Sem esta
+        // checagem, um erro de sintaxe vira bytecode incompleto/incorreto em vez de falhar.
+        // Gap real de UX do parser (não do compilador): documentado em PLAN.md.
+        if (retornoAvaliadorSintatico.erros && retornoAvaliadorSintatico.erros.length > 0) {
+            const mensagens = retornoAvaliadorSintatico.erros
+                .map((erro: any) => `linha ${erro.linha}: símbolo '${erro.simbolo?.lexema}' (${erro.codigoDiagnostico})`)
+                .join('; ');
+            throw new ErroCompilador(`Erro de sintaxe: ${mensagens}`);
+        }
+
+        // Registrar assinaturas antes de compilar qualquer corpo: permite recursão e chamada
+        // a funções declaradas mais abaixo no arquivo.
+        this.registrarFuncoes(declaracoes);
 
         for (const declaracao of declaracoes) {
             await declaracao.aceitar(this as any);
@@ -103,8 +142,41 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         return this.montarModulo();
     }
 
+    private registrarFuncoes(declaracoes: Declaracao[]): void {
+        for (const declaracao of declaracoes) {
+            if (!(declaracao instanceof FuncaoDeclaracao)) continue;
+
+            const nomeJvm = declaracao.simbolo.lexema;
+            if (this.funcoes.has(nomeJvm)) {
+                throw new ErroCompilador(`Função '${nomeJvm}' já declarada.`);
+            }
+
+            const parametros: ParametroFuncao[] = declaracao.funcao.parametros.map((parametro) => {
+                if (!parametro.tipoDado) {
+                    throw new ErroCompilador(`Parâmetro '${parametro.nome.lexema}' da função '${nomeJvm}' precisa de tipo explícito.`);
+                }
+                const tipoDelegua = this.normalizarTipo(parametro.tipoDado);
+                return { nome: parametro.nome.lexema, tipoDelegua, tipoJvm: this.mapearTipoJvm(tipoDelegua) };
+            });
+
+            // `declaracao.tipo` é a string decorativa `função<...>`; o tipo de retorno
+            // usável (explícito, inferido a partir de `retorna`, ou 'vazio') está em
+            // `declaracao.funcao.tipo`.
+            const tipoRetornoBruto = declaracao.funcao.tipo || 'vazio';
+            if (tipoRetornoBruto === 'qualquer') {
+                throw new ErroCompilador(`Função '${nomeJvm}' precisa de tipo de retorno explícito.`);
+            }
+            const tipoRetornoDelegua = tipoRetornoBruto === 'vazio' ? 'vazio' : this.normalizarTipo(tipoRetornoBruto);
+            const tipoRetornoJvm = tipoRetornoDelegua === 'vazio' ? 'V' : this.mapearTipoJvm(tipoRetornoDelegua);
+            const descritor = `(${parametros.map((parametro) => parametro.tipoJvm).join('')})${tipoRetornoJvm}`;
+
+            this.funcoes.set(nomeJvm, { nomeJvm, parametros, tipoRetornoDelegua, tipoRetornoJvm, descritor });
+        }
+    }
+
     private montarModulo(): string {
         const corpo = this.instrucoes.map((instrucao) => `        ${instrucao}`).join('\n');
+        const metodosExtras = this.metodosGerados.length ? '\n' + this.metodosGerados.join('\n') : '';
 
         return (
             `.class public ${this.nomeClasse}\n` +
@@ -119,7 +191,8 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             `    .limit locals ${this.proximoSlot}\n` +
             (corpo ? corpo + '\n' : '') +
             `        return\n` +
-            `.end method\n`
+            `.end method\n` +
+            metodosExtras
         );
     }
 
@@ -157,6 +230,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             if (construto.operador.tipo === 'DIVISAO') return 'numero';
             const tipoEsquerdo = this.resolverTipoConstruto(construto.esquerda);
             const tipoDireito = this.resolverTipoConstruto(construto.direita);
+            if (construto.operador.tipo === 'ADICAO' && (tipoEsquerdo === 'texto' || tipoDireito === 'texto')) return 'texto';
             return tipoEsquerdo === 'numero' || tipoDireito === 'numero' ? 'numero' : 'inteiro';
         }
         if (construto instanceof Logico) return 'logico';
@@ -167,7 +241,20 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         if (construto instanceof Agrupamento) {
             return this.resolverTipoConstruto((construto as any).expressao);
         }
+        if (construto instanceof Chamada) {
+            return this.resolverInfoFuncaoChamada(construto).tipoRetornoDelegua;
+        }
         throw new ErroCompilador('Não foi possível resolver o tipo da expressão.');
+    }
+
+    private resolverInfoFuncaoChamada(expressao: Chamada): FuncaoInfo {
+        if (!(expressao.entidadeChamada instanceof Variavel)) {
+            throw new ErroCompilador('Só é possível chamar funções pelo nome diretamente.');
+        }
+        const nomeFuncao = expressao.entidadeChamada.simbolo.lexema;
+        const info = this.funcoes.get(nomeFuncao);
+        if (!info) throw new ErroCompilador(`Função '${nomeFuncao}' não declarada.`);
+        return info;
     }
 
     private gerarRotulo(prefixo: string): string {
@@ -178,7 +265,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     private async emitirComoDeclaracaoDeExpressao(construto: any): Promise<void> {
         const tipo = await construto.aceitar(this as any);
         if (tipo === 'numero') this.instrucoes.push('pop2');
-        else if (tipo) this.instrucoes.push('pop');
+        else if (tipo && tipo !== 'vazio') this.instrucoes.push('pop');
     }
 
     private escaparTexto(valor: string): string {
@@ -263,9 +350,14 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             return await this.compilarComparacao(expressao);
         }
 
-        const divisao = expressao.operador.tipo === 'DIVISAO';
         const tipoEsquerdo = this.resolverTipoConstruto(expressao.esquerda);
         const tipoDireito = this.resolverTipoConstruto(expressao.direita);
+
+        if (expressao.operador.tipo === 'ADICAO' && (tipoEsquerdo === 'texto' || tipoDireito === 'texto')) {
+            return await this.compilarConcatenacaoTexto(expressao, tipoEsquerdo, tipoDireito);
+        }
+
+        const divisao = expressao.operador.tipo === 'DIVISAO';
         const tipoPrevalente = divisao || tipoEsquerdo === 'numero' || tipoDireito === 'numero' ? 'numero' : 'inteiro';
 
         await expressao.esquerda.aceitar(this as any);
@@ -342,6 +434,33 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         }
 
         return 'logico';
+    }
+
+    private async compilarConcatenacaoTexto(expressao: Binario, tipoEsquerdo: string, tipoDireito: string): Promise<string> {
+        await expressao.esquerda.aceitar(this as any);
+        this.converterParaTexto(tipoEsquerdo);
+        await expressao.direita.aceitar(this as any);
+        this.converterParaTexto(tipoDireito);
+        this.instrucoes.push('invokevirtual java/lang/String/concat(Ljava/lang/String;)Ljava/lang/String;');
+        return 'texto';
+    }
+
+    private converterParaTexto(tipo: string): void {
+        switch (tipo) {
+            case 'texto':
+                return;
+            case 'inteiro':
+                this.instrucoes.push('invokestatic java/lang/String/valueOf(I)Ljava/lang/String;');
+                break;
+            case 'numero':
+                this.instrucoes.push('invokestatic java/lang/String/valueOf(D)Ljava/lang/String;');
+                break;
+            case 'logico':
+                this.instrucoes.push('invokestatic java/lang/String/valueOf(Z)Ljava/lang/String;');
+                break;
+            default:
+                throw new ErroCompilador(`Não sabe converter tipo '${tipo}' para texto.`);
+        }
     }
 
     async visitarExpressaoLogica(expressao: Logico): Promise<string> {
@@ -450,6 +569,89 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         }
 
         return local.tipoDelegua;
+    }
+
+    async visitarDeclaracaoDefinicaoFuncao(declaracao: FuncaoDeclaracao): Promise<any> {
+        const info = this.funcoes.get(declaracao.simbolo.lexema);
+        if (!info) throw new ErroCompilador(`Função '${declaracao.simbolo.lexema}' não registrada.`);
+
+        // Funções viram `.method private static` isolados: salva o contexto do método atual
+        // (ex.: `main`, ou quem chamou esta função) e restaura ao final.
+        const instrucoesAnteriores = this.instrucoes;
+        const variaveisAnteriores = this.variaveis;
+        const slotAnterior = this.proximoSlot;
+        const tipoRetornoAnterior = this.tipoRetornoAtual;
+
+        this.instrucoes = [];
+        this.variaveis = new Map();
+        this.proximoSlot = 0;
+        this.tipoRetornoAtual = info.tipoRetornoDelegua;
+
+        for (const parametro of info.parametros) {
+            const slot = this.proximoSlot;
+            this.proximoSlot += parametro.tipoJvm === 'D' ? 2 : 1;
+            this.variaveis.set(parametro.nome, { slot, tipoJvm: parametro.tipoJvm, tipoDelegua: parametro.tipoDelegua });
+        }
+
+        for (const decl of declaracao.funcao.corpo) {
+            await decl.aceitar(this as any);
+        }
+        // Funções `vazio` podem não terminar com `retorna` explícito; instrução extra e
+        // inalcançável não tem custo caso o corpo já termine em `return`.
+        if (info.tipoRetornoJvm === 'V') this.instrucoes.push('return');
+
+        const corpoTexto = this.instrucoes.map((instrucao) => `        ${instrucao}`).join('\n');
+        this.metodosGerados.push(
+            `.method private static ${info.nomeJvm}${info.descritor}\n` +
+                `    .limit stack 32\n` +
+                `    .limit locals ${this.proximoSlot}\n` +
+                (corpoTexto ? corpoTexto + '\n' : '') +
+                `.end method\n`
+        );
+
+        this.instrucoes = instrucoesAnteriores;
+        this.variaveis = variaveisAnteriores;
+        this.proximoSlot = slotAnterior;
+        this.tipoRetornoAtual = tipoRetornoAnterior;
+    }
+
+    async visitarExpressaoDeChamada(expressao: Chamada): Promise<string> {
+        const info = this.resolverInfoFuncaoChamada(expressao);
+
+        if (expressao.argumentos.length !== info.parametros.length) {
+            throw new ErroCompilador(
+                `Função '${info.nomeJvm}' espera ${info.parametros.length} argumento(s), recebeu ${expressao.argumentos.length}.`
+            );
+        }
+
+        for (let i = 0; i < expressao.argumentos.length; i++) {
+            const tipoArgumento = await expressao.argumentos[i].aceitar(this as any);
+            if (tipoArgumento === 'inteiro' && info.parametros[i].tipoDelegua === 'numero') this.instrucoes.push('i2d');
+        }
+
+        this.instrucoes.push(`invokestatic ${this.nomeClasse}/${info.nomeJvm}${info.descritor}`);
+        return info.tipoRetornoDelegua;
+    }
+
+    async visitarExpressaoRetornar(declaracao: Retorna): Promise<any> {
+        if (!declaracao.valor) {
+            this.instrucoes.push('return');
+            return;
+        }
+
+        const tipoValor = await declaracao.valor.aceitar(this as any);
+        if (tipoValor === 'inteiro' && this.tipoRetornoAtual === 'numero') this.instrucoes.push('i2d');
+
+        switch (this.tipoRetornoAtual) {
+            case 'numero':
+                this.instrucoes.push('dreturn');
+                break;
+            case 'texto':
+                this.instrucoes.push('areturn');
+                break;
+            default:
+                this.instrucoes.push('ireturn');
+        }
     }
 
     async visitarExpressaoBloco(declaracao: Bloco): Promise<any> {

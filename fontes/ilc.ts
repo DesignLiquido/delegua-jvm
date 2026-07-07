@@ -41,11 +41,21 @@ async function principal() {
         fs.writeFileSync(caminhoJ, jasmin);
         console.log(`Jasmin gerado: ${caminhoJ}`);
 
+        // Cada `classe` Delégua vira um `.class` próprio (não cabe no `.j` do programa principal).
+        const classesGeradas = compilador.obterClassesGeradas();
+        const caminhosJDasClasses: string[] = [];
+        for (const [nomeClasse, jasminClasse] of classesGeradas) {
+            const caminhoJDaClasse = path.join(diretorioSaida, `${nomeClasse}.j`);
+            fs.writeFileSync(caminhoJDaClasse, jasminClasse);
+            caminhosJDasClasses.push(caminhoJDaClasse);
+            console.log(`Jasmin gerado: ${caminhoJDaClasse}`);
+        }
+
         const caminhoJasminJar = localizarJasmin();
         if (!caminhoJasminJar) {
             console.log('');
-            console.log('Aviso: jasmin.jar não encontrado. O arquivo .j foi gerado,');
-            console.log('mas não foi montado em um .class.');
+            console.log('Aviso: jasmin.jar não encontrado. O(s) arquivo(s) .j foram gerados,');
+            console.log('mas não foram montados em .class.');
             console.log('');
             console.log('Defina a variável de ambiente JASMIN_JAR apontando para o jasmin.jar,');
             console.log('ou coloque-o em ./ferramentas/jasmin.jar.');
@@ -53,8 +63,13 @@ async function principal() {
         }
 
         console.log('Montando .class...');
-        execSync(`java -jar "${caminhoJasminJar}" -d "${diretorioSaida}" "${caminhoJ}"`, { stdio: 'inherit' });
+        for (const caminhoJAtual of [caminhoJ, ...caminhosJDasClasses]) {
+            execSync(`java -jar "${caminhoJasminJar}" -d "${diretorioSaida}" "${caminhoJAtual}"`, { stdio: 'inherit' });
+        }
         console.log(`Classe gerada: ${path.join(diretorioSaida, `${nomeBase}.class`)}`);
+        for (const nomeClasse of classesGeradas.keys()) {
+            console.log(`Classe gerada: ${path.join(diretorioSaida, `${nomeClasse}.class`)}`);
+        }
     } catch (erro: any) {
         if (erro instanceof ErroCompilador) {
             console.error(`erro: ${erro.message}`);

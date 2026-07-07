@@ -1,23 +1,28 @@
 import {
+    AcessoMetodoOuPropriedade,
     Agrupamento,
     Atribuir,
     AvaliadorSintatico,
     Binario,
     Bloco,
     Chamada,
+    Classe,
     Continua,
     Declaracao,
+    DefinirValor,
     Enquanto,
     Escolha,
     Escreva,
     Expressao,
     FuncaoDeclaracao,
+    Isto,
     Lexador,
     Literal,
     Logico,
     Para,
     Retorna,
     Se,
+    Super,
     Sustar,
     Unario,
     Var,
@@ -67,6 +72,21 @@ interface FuncaoInfo {
     descritor: string;
 }
 
+interface InfoCampo {
+    nome: string;
+    tipoDelegua: string;
+    tipoJvm: string;
+}
+
+interface InfoClasse {
+    nome: string;
+    nomeSuper?: string;
+    nomeJvmSuper: string;
+    campos: Map<string, InfoCampo>;
+    metodos: Map<string, FuncaoInfo>;
+    construtor?: FuncaoInfo;
+}
+
 const MAPA_TIPOS_JVM: Record<string, string> = {
     inteiro: 'I',
     numero: 'D',
@@ -96,6 +116,11 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     private metodosGerados: string[];
     // Tipo Delégua declarado para o `retorna` da função sendo compilada agora ('vazio' em `main`).
     private tipoRetornoAtual: string;
+    private classes: Map<string, InfoClasse>;
+    // Classe sendo compilada agora (contexto de `isto`/`super`); `null` fora de método de instância.
+    private classeAtual: InfoClasse | null;
+    // Uma classe Delégua vira um `.class` Jasmin à parte (não cabe no `.j` de `Programa`).
+    private classesGeradas: Map<string, string>;
 
     constructor() {
         super();
@@ -115,6 +140,9 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.funcoes = new Map();
         this.metodosGerados = [];
         this.tipoRetornoAtual = 'vazio';
+        this.classes = new Map();
+        this.classeAtual = null;
+        this.classesGeradas = new Map();
 
         const retornoLexador = this.lexador.mapear(codigo, -1);
         const retornoAvaliadorSintatico: any = await this.avaliadorSintatico.analisar(retornoLexador, -1);
@@ -132,7 +160,8 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         }
 
         // Registrar assinaturas antes de compilar qualquer corpo: permite recursão e chamada
-        // a funções declaradas mais abaixo no arquivo.
+        // a funções/classes declaradas mais abaixo no arquivo.
+        this.registrarClasses(declaracoes);
         this.registrarFuncoes(declaracoes);
 
         for (const declaracao of declaracoes) {
@@ -140,6 +169,11 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         }
 
         return this.montarModulo();
+    }
+
+    /** Jasmin de cada `classe` Delégua compilada — cada uma é um `.class` próprio, à parte de `Programa`. */
+    obterClassesGeradas(): Map<string, string> {
+        return this.classesGeradas;
     }
 
     private registrarFuncoes(declaracoes: Declaracao[]): void {
@@ -174,6 +208,128 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         }
     }
 
+    private registrarClasses(declaracoes: Declaracao[]): void {
+        const declsClasse = declaracoes.filter((declaracao): declaracao is Classe => declaracao instanceof Classe);
+
+        // Passo 1: registra o nome de cada classe antes de resolver membros, permitindo
+        // referências cruzadas (campos/parâmetros tipados com outra classe) independentes
+        // de ordem de declaração no arquivo.
+        for (const declaracao of declsClasse) {
+            if (this.classes.has(declaracao.simbolo.lexema)) {
+                throw new ErroCompilador(`Classe '${declaracao.simbolo.lexema}' já declarada.`);
+            }
+            if (declaracao.superClasses.length > 1) {
+                throw new ErroCompilador(`Classe '${declaracao.simbolo.lexema}': herança múltipla não suportada na JVM.`);
+            }
+            const nomeSuper = declaracao.superClasses.length > 0 ? declaracao.superClasses[0].simbolo.lexema : undefined;
+            this.classes.set(declaracao.simbolo.lexema, {
+                nome: declaracao.simbolo.lexema,
+                nomeSuper,
+                nomeJvmSuper: nomeSuper || 'java/lang/Object',
+                campos: new Map(),
+                metodos: new Map(),
+            });
+        }
+
+        // Passo 2: resolve campos e métodos, já com todas as classes do arquivo registradas.
+        for (const declaracao of declsClasse) {
+            const info = this.classes.get(declaracao.simbolo.lexema)!;
+
+            for (const propriedade of declaracao.propriedades) {
+                if (propriedade.estatico) {
+                    throw new ErroCompilador(`Propriedade estática '${propriedade.nome.lexema}' ainda não suportada (classe '${info.nome}').`);
+                }
+                if (propriedade.autoObter || propriedade.autoDefinir) {
+                    throw new ErroCompilador(`Auto-propriedades (obter/definir) ainda não suportadas (classe '${info.nome}').`);
+                }
+                if (!propriedade.tipo) {
+                    throw new ErroCompilador(`Propriedade '${propriedade.nome.lexema}' da classe '${info.nome}' precisa de tipo explícito.`);
+                }
+                const tipoDelegua = this.normalizarTipo(propriedade.tipo);
+                info.campos.set(propriedade.nome.lexema, {
+                    nome: propriedade.nome.lexema,
+                    tipoDelegua,
+                    tipoJvm: this.mapearTipoJvm(tipoDelegua),
+                });
+            }
+
+            for (const metodoDecl of declaracao.metodos) {
+                if ((metodoDecl as any).abstrato) {
+                    throw new ErroCompilador(`Método abstrato '${metodoDecl.simbolo.lexema}' ainda não suportado (classe '${info.nome}').`);
+                }
+                if ((metodoDecl as any).eObtenedor || (metodoDecl as any).eDefinidor) {
+                    throw new ErroCompilador(`Obtenedor/definidor personalizado ainda não suportado (classe '${info.nome}').`);
+                }
+                if (metodoDecl.estatico) {
+                    throw new ErroCompilador(`Método estático '${metodoDecl.simbolo.lexema}' ainda não suportado (classe '${info.nome}').`);
+                }
+
+                const ehConstrutor = metodoDecl.simbolo.lexema === 'construtor';
+                const parametros: ParametroFuncao[] = metodoDecl.funcao.parametros.map((parametro) => {
+                    if (!parametro.tipoDado) {
+                        throw new ErroCompilador(
+                            `Parâmetro '${parametro.nome.lexema}' de '${info.nome}.${metodoDecl.simbolo.lexema}' precisa de tipo explícito.`
+                        );
+                    }
+                    const tipoDelegua = this.normalizarTipo(parametro.tipoDado);
+                    return { nome: parametro.nome.lexema, tipoDelegua, tipoJvm: this.mapearTipoJvm(tipoDelegua) };
+                });
+
+                if (ehConstrutor) {
+                    info.construtor = {
+                        nomeJvm: '<init>',
+                        parametros,
+                        tipoRetornoDelegua: 'vazio',
+                        tipoRetornoJvm: 'V',
+                        descritor: `(${parametros.map((parametro) => parametro.tipoJvm).join('')})V`,
+                    };
+                    continue;
+                }
+
+                const tipoRetornoBruto = metodoDecl.funcao.tipo || 'vazio';
+                if (tipoRetornoBruto === 'qualquer') {
+                    throw new ErroCompilador(`Método '${info.nome}.${metodoDecl.simbolo.lexema}' precisa de tipo de retorno explícito.`);
+                }
+                const tipoRetornoDelegua = tipoRetornoBruto === 'vazio' ? 'vazio' : this.normalizarTipo(tipoRetornoBruto);
+                const tipoRetornoJvm = tipoRetornoDelegua === 'vazio' ? 'V' : this.mapearTipoJvm(tipoRetornoDelegua);
+                const descritor = `(${parametros.map((parametro) => parametro.tipoJvm).join('')})${tipoRetornoJvm}`;
+
+                info.metodos.set(metodoDecl.simbolo.lexema, {
+                    nomeJvm: metodoDecl.simbolo.lexema,
+                    parametros,
+                    tipoRetornoDelegua,
+                    tipoRetornoJvm,
+                    descritor,
+                });
+            }
+
+            // Sem construtor explícito: gera um `<init>()V` trivial (só encadeia o super padrão).
+            if (!info.construtor) {
+                info.construtor = { nomeJvm: '<init>', parametros: [], tipoRetornoDelegua: 'vazio', tipoRetornoJvm: 'V', descritor: '()V' };
+            }
+        }
+    }
+
+    private buscarCampoComOrigem(nomeClasse: string, nomeCampo: string): { campo: InfoCampo; nomeClasseOrigem: string } | null {
+        let atual = this.classes.get(nomeClasse);
+        while (atual) {
+            const campo = atual.campos.get(nomeCampo);
+            if (campo) return { campo, nomeClasseOrigem: atual.nome };
+            atual = atual.nomeSuper ? this.classes.get(atual.nomeSuper) : undefined;
+        }
+        return null;
+    }
+
+    private buscarMetodoComOrigem(nomeClasse: string, nomeMetodo: string): { metodo: FuncaoInfo; nomeClasseOrigem: string } | null {
+        let atual = this.classes.get(nomeClasse);
+        while (atual) {
+            const metodo = atual.metodos.get(nomeMetodo);
+            if (metodo) return { metodo, nomeClasseOrigem: atual.nome };
+            atual = atual.nomeSuper ? this.classes.get(atual.nomeSuper) : undefined;
+        }
+        return null;
+    }
+
     private montarModulo(): string {
         const corpo = this.instrucoes.map((instrucao) => `        ${instrucao}`).join('\n');
         const metodosExtras = this.metodosGerados.length ? '\n' + this.metodosGerados.join('\n') : '';
@@ -204,10 +360,14 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
 
     private mapearTipoJvm(tipoDelegua: string): string {
         const tipoJvm = MAPA_TIPOS_JVM[tipoDelegua];
-        if (!tipoJvm) {
-            throw new ErroCompilador(`Tipo '${tipoDelegua}' não implementado para JVM.`);
-        }
-        return tipoJvm;
+        if (tipoJvm) return tipoJvm;
+        // Não é primitivo: só resta ser o nome de uma `classe` já registrada (tipo referência).
+        if (this.classes.has(tipoDelegua)) return `L${tipoDelegua};`;
+        throw new ErroCompilador(`Tipo '${tipoDelegua}' não implementado para JVM.`);
+    }
+
+    private ehTipoReferencia(tipoJvm: string): boolean {
+        return tipoJvm.startsWith('L') && tipoJvm.endsWith(';');
     }
 
     private resolverTipoConstruto(construto: any): string {
@@ -241,10 +401,44 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         if (construto instanceof Agrupamento) {
             return this.resolverTipoConstruto((construto as any).expressao);
         }
+        if (construto instanceof Isto) {
+            if (!this.classeAtual) throw new ErroCompilador("'isto' usado fora de um método de instância.");
+            return this.classeAtual.nome;
+        }
+        if (construto instanceof Super) {
+            if (!this.classeAtual?.nomeSuper) throw new ErroCompilador("'super' usado em classe sem superclasse.");
+            return this.classeAtual.nomeSuper;
+        }
+        if (construto instanceof AcessoMetodoOuPropriedade) {
+            const nomeClasseObjeto = this.resolverTipoConstruto(construto.objeto);
+            const resolvido = this.buscarCampoComOrigem(nomeClasseObjeto, construto.simbolo.lexema);
+            if (!resolvido) {
+                throw new ErroCompilador(`Propriedade '${construto.simbolo.lexema}' não encontrada na classe '${nomeClasseObjeto}'.`);
+            }
+            return resolvido.campo.tipoDelegua;
+        }
         if (construto instanceof Chamada) {
-            return this.resolverInfoFuncaoChamada(construto).tipoRetornoDelegua;
+            return this.resolverTipoChamada(construto);
         }
         throw new ErroCompilador('Não foi possível resolver o tipo da expressão.');
+    }
+
+    private resolverTipoChamada(expressao: Chamada): string {
+        if (expressao.entidadeChamada instanceof Variavel && this.classes.has(expressao.entidadeChamada.simbolo.lexema)) {
+            return expressao.entidadeChamada.simbolo.lexema;
+        }
+        if (expressao.entidadeChamada instanceof Super) {
+            return 'vazio';
+        }
+        if (expressao.entidadeChamada instanceof AcessoMetodoOuPropriedade) {
+            const nomeClasseObjeto = this.resolverTipoConstruto(expressao.entidadeChamada.objeto);
+            const resolvido = this.buscarMetodoComOrigem(nomeClasseObjeto, expressao.entidadeChamada.simbolo.lexema);
+            if (!resolvido) {
+                throw new ErroCompilador(`Método '${expressao.entidadeChamada.simbolo.lexema}' não encontrado na classe '${nomeClasseObjeto}'.`);
+            }
+            return resolvido.metodo.tipoRetornoDelegua;
+        }
+        return this.resolverInfoFuncaoChamada(expressao).tipoRetornoDelegua;
     }
 
     private resolverInfoFuncaoChamada(expressao: Chamada): FuncaoInfo {
@@ -288,16 +482,9 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.proximoSlot += tipoJvm === 'D' ? 2 : 1;
         this.variaveis.set(declaracao.simbolo.lexema, { slot, tipoJvm, tipoDelegua });
 
-        switch (tipoJvm) {
-            case 'D':
-                this.instrucoes.push(`dstore ${slot}`);
-                break;
-            case 'Ljava/lang/String;':
-                this.instrucoes.push(`astore ${slot}`);
-                break;
-            default:
-                this.instrucoes.push(`istore ${slot}`);
-        }
+        if (tipoJvm === 'D') this.instrucoes.push(`dstore ${slot}`);
+        else if (this.ehTipoReferencia(tipoJvm)) this.instrucoes.push(`astore ${slot}`);
+        else this.instrucoes.push(`istore ${slot}`);
     }
 
     async visitarExpressaoLiteral(expressao: Literal): Promise<string> {
@@ -328,16 +515,9 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     async visitarExpressaoDeVariavel(expressao: Variavel): Promise<string> {
         const local = this.variaveis.get(expressao.simbolo.lexema);
         if (!local) throw new ErroCompilador(`Variável '${expressao.simbolo.lexema}' não declarada.`);
-        switch (local.tipoJvm) {
-            case 'D':
-                this.instrucoes.push(`dload ${local.slot}`);
-                break;
-            case 'Ljava/lang/String;':
-                this.instrucoes.push(`aload ${local.slot}`);
-                break;
-            default:
-                this.instrucoes.push(`iload ${local.slot}`);
-        }
+        if (local.tipoJvm === 'D') this.instrucoes.push(`dload ${local.slot}`);
+        else if (this.ehTipoReferencia(local.tipoJvm)) this.instrucoes.push(`aload ${local.slot}`);
+        else this.instrucoes.push(`iload ${local.slot}`);
         return local.tipoDelegua;
     }
 
@@ -554,18 +734,15 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         if (tipoValor === 'inteiro' && local.tipoDelegua === 'numero') this.instrucoes.push('i2d');
 
         // Deixa o valor atribuído duplicado na pilha: `Atribuir` é uma expressão (ex.: `x = y = 5`).
-        switch (local.tipoJvm) {
-            case 'D':
-                this.instrucoes.push('dup2');
-                this.instrucoes.push(`dstore ${local.slot}`);
-                break;
-            case 'Ljava/lang/String;':
-                this.instrucoes.push('dup');
-                this.instrucoes.push(`astore ${local.slot}`);
-                break;
-            default:
-                this.instrucoes.push('dup');
-                this.instrucoes.push(`istore ${local.slot}`);
+        if (local.tipoJvm === 'D') {
+            this.instrucoes.push('dup2');
+            this.instrucoes.push(`dstore ${local.slot}`);
+        } else if (this.ehTipoReferencia(local.tipoJvm)) {
+            this.instrucoes.push('dup');
+            this.instrucoes.push(`astore ${local.slot}`);
+        } else {
+            this.instrucoes.push('dup');
+            this.instrucoes.push(`istore ${local.slot}`);
         }
 
         return local.tipoDelegua;
@@ -616,6 +793,21 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     }
 
     async visitarExpressaoDeChamada(expressao: Chamada): Promise<string> {
+        // `NomeClasse(args)`: instanciação — não há palavra-chave `novo` em Delégua.
+        if (expressao.entidadeChamada instanceof Variavel && this.classes.has(expressao.entidadeChamada.simbolo.lexema)) {
+            return await this.compilarInstanciacao(expressao);
+        }
+
+        // `super(args)`: encadeamento explícito ao construtor da superclasse.
+        if (expressao.entidadeChamada instanceof Super) {
+            return await this.compilarChamadaSuperConstrutor(expressao);
+        }
+
+        // `objeto.metodo(args)` ou `super.metodo(args)`.
+        if (expressao.entidadeChamada instanceof AcessoMetodoOuPropriedade) {
+            return await this.compilarChamadaMetodo(expressao);
+        }
+
         const info = this.resolverInfoFuncaoChamada(expressao);
 
         if (expressao.argumentos.length !== info.parametros.length) {
@@ -633,6 +825,66 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         return info.tipoRetornoDelegua;
     }
 
+    private async compilarArgumentos(argumentos: any[], parametros: ParametroFuncao[], nomeAlvo: string): Promise<void> {
+        if (argumentos.length !== parametros.length) {
+            throw new ErroCompilador(`'${nomeAlvo}' espera ${parametros.length} argumento(s), recebeu ${argumentos.length}.`);
+        }
+        for (let i = 0; i < argumentos.length; i++) {
+            const tipoArgumento = await argumentos[i].aceitar(this as any);
+            if (tipoArgumento === 'inteiro' && parametros[i].tipoDelegua === 'numero') this.instrucoes.push('i2d');
+        }
+    }
+
+    private async compilarInstanciacao(expressao: Chamada): Promise<string> {
+        const nomeClasse = (expressao.entidadeChamada as Variavel).simbolo.lexema;
+        const infoClasse = this.classes.get(nomeClasse)!;
+
+        this.instrucoes.push(`new ${nomeClasse}`);
+        this.instrucoes.push('dup');
+        await this.compilarArgumentos(expressao.argumentos, infoClasse.construtor!.parametros, nomeClasse);
+        this.instrucoes.push(`invokespecial ${nomeClasse}/<init>${infoClasse.construtor!.descritor}`);
+        return nomeClasse;
+    }
+
+    private async compilarChamadaSuperConstrutor(expressao: Chamada): Promise<string> {
+        if (!this.classeAtual?.nomeSuper) {
+            throw new ErroCompilador("'super(...)' usado em classe sem superclasse.");
+        }
+        const infoSuper = this.classes.get(this.classeAtual.nomeSuper);
+        if (!infoSuper?.construtor) {
+            throw new ErroCompilador(`Superclasse '${this.classeAtual.nomeSuper}' não tem construtor gerado.`);
+        }
+
+        this.instrucoes.push('aload_0');
+        await this.compilarArgumentos(expressao.argumentos, infoSuper.construtor.parametros, `${this.classeAtual.nomeSuper}.construtor`);
+        this.instrucoes.push(`invokespecial ${this.classeAtual.nomeSuper}/<init>${infoSuper.construtor.descritor}`);
+        return 'vazio';
+    }
+
+    private async compilarChamadaMetodo(expressao: Chamada): Promise<string> {
+        const acesso = expressao.entidadeChamada as AcessoMetodoOuPropriedade;
+        const ehSuper = acesso.objeto instanceof Super;
+        const nomeClasseObjeto = this.resolverTipoConstruto(acesso.objeto);
+        const resolvido = this.buscarMetodoComOrigem(nomeClasseObjeto, acesso.simbolo.lexema);
+        if (!resolvido) {
+            throw new ErroCompilador(`Método '${acesso.simbolo.lexema}' não encontrado na classe '${nomeClasseObjeto}'.`);
+        }
+        const { metodo, nomeClasseOrigem } = resolvido;
+
+        if (acesso.objeto instanceof Isto || ehSuper) this.instrucoes.push('aload_0');
+        else await acesso.objeto.aceitar(this as any);
+
+        await this.compilarArgumentos(expressao.argumentos, metodo.parametros, `${nomeClasseObjeto}.${metodo.nomeJvm}`);
+
+        // Despacho virtual (`invokevirtual`) deixa a JVM resolver polimorfismo nativamente;
+        // `super.metodo(...)` é a exceção deliberada — precisa de `invokespecial` para não
+        // reentrar no override da própria subclasse.
+        const instrucaoInvoke = ehSuper ? 'invokespecial' : 'invokevirtual';
+        const nomeClasseParaInvoke = ehSuper ? nomeClasseOrigem : nomeClasseObjeto;
+        this.instrucoes.push(`${instrucaoInvoke} ${nomeClasseParaInvoke}/${metodo.nomeJvm}${metodo.descritor}`);
+        return metodo.tipoRetornoDelegua;
+    }
+
     async visitarExpressaoRetornar(declaracao: Retorna): Promise<any> {
         if (!declaracao.valor) {
             this.instrucoes.push('return');
@@ -642,16 +894,10 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         const tipoValor = await declaracao.valor.aceitar(this as any);
         if (tipoValor === 'inteiro' && this.tipoRetornoAtual === 'numero') this.instrucoes.push('i2d');
 
-        switch (this.tipoRetornoAtual) {
-            case 'numero':
-                this.instrucoes.push('dreturn');
-                break;
-            case 'texto':
-                this.instrucoes.push('areturn');
-                break;
-            default:
-                this.instrucoes.push('ireturn');
-        }
+        const tipoJvmRetorno = this.mapearTipoJvm(this.tipoRetornoAtual);
+        if (tipoJvmRetorno === 'D') this.instrucoes.push('dreturn');
+        else if (this.ehTipoReferencia(tipoJvmRetorno)) this.instrucoes.push('areturn');
+        else this.instrucoes.push('ireturn');
     }
 
     async visitarExpressaoBloco(declaracao: Bloco): Promise<any> {
@@ -734,9 +980,12 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
 
     async visitarDeclaracaoEscolha(declaracao: Escolha): Promise<any> {
         const tipoAlvo = this.resolverTipoConstruto(declaracao.identificadorOuLiteral);
+        const tipoJvmAlvo = this.mapearTipoJvm(tipoAlvo);
+        if (this.ehTipoReferencia(tipoJvmAlvo) && tipoJvmAlvo !== 'Ljava/lang/String;') {
+            throw new ErroCompilador(`'escolha' sobre instância de classe ('${tipoAlvo}') ainda não suportado.`);
+        }
         await declaracao.identificadorOuLiteral.aceitar(this as any);
 
-        const tipoJvmAlvo = this.mapearTipoJvm(tipoAlvo);
         const slotTemp = this.proximoSlot;
         this.proximoSlot += tipoJvmAlvo === 'D' ? 2 : 1;
 
@@ -833,5 +1082,189 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
                     throw new ErroCompilador(`Não sabe como escrever valor de tipo '${tipo}'.`);
             }
         }
+    }
+
+    async visitarDeclaracaoClasse(declaracao: Classe): Promise<any> {
+        const info = this.classes.get(declaracao.simbolo.lexema);
+        if (!info) throw new ErroCompilador(`Classe '${declaracao.simbolo.lexema}' não registrada.`);
+
+        const metodosTexto: string[] = [await this.compilarConstrutorClasse(declaracao, info)];
+        for (const metodoDecl of declaracao.metodos) {
+            if (metodoDecl.simbolo.lexema === 'construtor') continue;
+            metodosTexto.push(await this.compilarMetodoClasse(info, metodoDecl));
+        }
+
+        const camposTexto = Array.from(info.campos.values())
+            .map((campo) => `.field public ${campo.nome} ${campo.tipoJvm}`)
+            .join('\n');
+
+        const classeTexto =
+            `.class public ${info.nome}\n` +
+            `.super ${info.nomeJvmSuper}\n\n` +
+            (camposTexto ? camposTexto + '\n\n' : '') +
+            metodosTexto.join('\n');
+
+        this.classesGeradas.set(info.nome, classeTexto);
+    }
+
+    // Constrói o `.method public <init>` da classe. Se não houver `construtor` explícito na
+    // primeira instrução chamando `super(...)`, insere a chamada padrão ao construtor sem
+    // argumentos da superclasse (ou de `java/lang/Object`, se não houver superclasse).
+    private async compilarConstrutorClasse(declaracao: Classe, info: InfoClasse): Promise<string> {
+        const metodoConstrutor = declaracao.metodos.find((metodo) => metodo.simbolo.lexema === 'construtor');
+        const corpoUsuario: Declaracao[] = metodoConstrutor ? metodoConstrutor.funcao.corpo : [];
+        const primeiroEhSuper =
+            corpoUsuario.length > 0 &&
+            corpoUsuario[0] instanceof Expressao &&
+            (corpoUsuario[0] as Expressao).expressao instanceof Chamada &&
+            ((corpoUsuario[0] as Expressao).expressao as Chamada).entidadeChamada instanceof Super;
+
+        const instrucoesAnteriores = this.instrucoes;
+        const variaveisAnteriores = this.variaveis;
+        const slotAnterior = this.proximoSlot;
+        const tipoRetornoAnterior = this.tipoRetornoAtual;
+        const classeAnterior = this.classeAtual;
+
+        this.instrucoes = [];
+        this.variaveis = new Map();
+        this.proximoSlot = 1; // slot 0 é `isto`.
+        this.tipoRetornoAtual = 'vazio';
+        this.classeAtual = info;
+
+        for (const parametro of info.construtor!.parametros) {
+            const slot = this.proximoSlot;
+            this.proximoSlot += parametro.tipoJvm === 'D' ? 2 : 1;
+            this.variaveis.set(parametro.nome, { slot, tipoJvm: parametro.tipoJvm, tipoDelegua: parametro.tipoDelegua });
+        }
+
+        if (!primeiroEhSuper) {
+            if (info.nomeSuper) {
+                const infoSuper = this.classes.get(info.nomeSuper);
+                if (!infoSuper?.construtor || infoSuper.construtor.parametros.length > 0) {
+                    throw new ErroCompilador(
+                        `Classe '${info.nome}' herda '${info.nomeSuper}', que não tem construtor sem argumentos: ` +
+                            `chame 'super(...)' explicitamente como primeira instrução do construtor.`
+                    );
+                }
+                this.instrucoes.push('aload_0');
+                this.instrucoes.push(`invokespecial ${info.nomeSuper}/<init>()V`);
+            } else {
+                this.instrucoes.push('aload_0');
+                this.instrucoes.push('invokespecial java/lang/Object/<init>()V');
+            }
+        }
+
+        for (const decl of corpoUsuario) {
+            await decl.aceitar(this as any);
+        }
+        this.instrucoes.push('return');
+
+        const corpoTexto = this.instrucoes.map((instrucao) => `        ${instrucao}`).join('\n');
+        const resultado =
+            `.method public <init>${info.construtor!.descritor}\n` +
+            `    .limit stack 32\n` +
+            `    .limit locals ${this.proximoSlot}\n` +
+            corpoTexto +
+            '\n' +
+            `.end method\n`;
+
+        this.instrucoes = instrucoesAnteriores;
+        this.variaveis = variaveisAnteriores;
+        this.proximoSlot = slotAnterior;
+        this.tipoRetornoAtual = tipoRetornoAnterior;
+        this.classeAtual = classeAnterior;
+
+        return resultado;
+    }
+
+    private async compilarMetodoClasse(info: InfoClasse, metodoDecl: FuncaoDeclaracao): Promise<string> {
+        const metodoInfo = info.metodos.get(metodoDecl.simbolo.lexema);
+        if (!metodoInfo) throw new ErroCompilador(`Método '${metodoDecl.simbolo.lexema}' não registrado na classe '${info.nome}'.`);
+
+        const instrucoesAnteriores = this.instrucoes;
+        const variaveisAnteriores = this.variaveis;
+        const slotAnterior = this.proximoSlot;
+        const tipoRetornoAnterior = this.tipoRetornoAtual;
+        const classeAnterior = this.classeAtual;
+
+        this.instrucoes = [];
+        this.variaveis = new Map();
+        this.proximoSlot = 1; // slot 0 é `isto`.
+        this.tipoRetornoAtual = metodoInfo.tipoRetornoDelegua;
+        this.classeAtual = info;
+
+        for (const parametro of metodoInfo.parametros) {
+            const slot = this.proximoSlot;
+            this.proximoSlot += parametro.tipoJvm === 'D' ? 2 : 1;
+            this.variaveis.set(parametro.nome, { slot, tipoJvm: parametro.tipoJvm, tipoDelegua: parametro.tipoDelegua });
+        }
+
+        for (const decl of metodoDecl.funcao.corpo) {
+            await decl.aceitar(this as any);
+        }
+        if (metodoInfo.tipoRetornoJvm === 'V') this.instrucoes.push('return');
+
+        const corpoTexto = this.instrucoes.map((instrucao) => `        ${instrucao}`).join('\n');
+        const resultado =
+            `.method public ${metodoInfo.nomeJvm}${metodoInfo.descritor}\n` +
+            `    .limit stack 32\n` +
+            `    .limit locals ${this.proximoSlot}\n` +
+            (corpoTexto ? corpoTexto + '\n' : '') +
+            `.end method\n`;
+
+        this.instrucoes = instrucoesAnteriores;
+        this.variaveis = variaveisAnteriores;
+        this.proximoSlot = slotAnterior;
+        this.tipoRetornoAtual = tipoRetornoAnterior;
+        this.classeAtual = classeAnterior;
+
+        return resultado;
+    }
+
+    async visitarExpressaoIsto(expressao: Isto): Promise<string> {
+        if (!this.classeAtual) throw new ErroCompilador("'isto' usado fora de um método de instância.");
+        this.instrucoes.push('aload_0');
+        return this.classeAtual.nome;
+    }
+
+    async visitarExpressaoSuper(expressao: Super): Promise<any> {
+        throw new ErroCompilador("'super' só pode ser usado em chamada de método ('super.metodo(...)') ou construtor ('super(...)').");
+    }
+
+    async visitarExpressaoAcessoMetodoOuPropriedade(expressao: AcessoMetodoOuPropriedade): Promise<string> {
+        const nomeClasseObjeto = this.resolverTipoConstruto(expressao.objeto);
+        const resolvido = this.buscarCampoComOrigem(nomeClasseObjeto, expressao.simbolo.lexema);
+        if (!resolvido) {
+            throw new ErroCompilador(`Propriedade '${expressao.simbolo.lexema}' não encontrada na classe '${nomeClasseObjeto}'.`);
+        }
+        const { campo, nomeClasseOrigem } = resolvido;
+
+        if (expressao.objeto instanceof Isto || expressao.objeto instanceof Super) this.instrucoes.push('aload_0');
+        else await expressao.objeto.aceitar(this as any);
+
+        this.instrucoes.push(`getfield ${nomeClasseOrigem}/${campo.nome} ${campo.tipoJvm}`);
+        return campo.tipoDelegua;
+    }
+
+    async visitarExpressaoDefinirValor(expressao: DefinirValor): Promise<string> {
+        const nomeClasseObjeto = this.resolverTipoConstruto(expressao.objeto);
+        const resolvido = this.buscarCampoComOrigem(nomeClasseObjeto, expressao.nome.lexema);
+        if (!resolvido) {
+            throw new ErroCompilador(`Propriedade '${expressao.nome.lexema}' não encontrada na classe '${nomeClasseObjeto}'.`);
+        }
+        const { campo, nomeClasseOrigem } = resolvido;
+
+        if (expressao.objeto instanceof Isto || expressao.objeto instanceof Super) this.instrucoes.push('aload_0');
+        else await expressao.objeto.aceitar(this as any);
+
+        const tipoValor = await expressao.valor.aceitar(this as any);
+        if (tipoValor === 'inteiro' && campo.tipoDelegua === 'numero') this.instrucoes.push('i2d');
+
+        // `DefinirValor` é expressão: `dup_x1`/`dup2_x1` preserva o valor atribuído no topo
+        // da pilha após o `putfield`, igual ao `dup`/`dup2` de `Atribuir` para variáveis.
+        this.instrucoes.push(campo.tipoJvm === 'D' ? 'dup2_x1' : 'dup_x1');
+        this.instrucoes.push(`putfield ${nomeClasseOrigem}/${expressao.nome.lexema} ${campo.tipoJvm}`);
+
+        return campo.tipoDelegua;
     }
 }

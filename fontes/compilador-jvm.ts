@@ -1,7 +1,12 @@
 import {
+    AcessoElementoMatriz,
+    AcessoIndiceVariavel,
+    AcessoIntervaloVariavel,
     AcessoMetodoOuPropriedade,
     Agrupamento,
     Atribuir,
+    AtribuicaoPorIndice,
+    AtribuicaoPorIndicesMatriz,
     AvaliadorSintatico,
     Binario,
     Bloco,
@@ -10,6 +15,7 @@ import {
     Continua,
     Declaracao,
     DefinirValor,
+    Dicionario,
     Enquanto,
     Escolha,
     Escreva,
@@ -24,9 +30,12 @@ import {
     Se,
     Super,
     Sustar,
+    Tupla,
+    TuplaN,
     Unario,
     Var,
     Variavel,
+    Vetor,
 } from '@designliquido/delegua';
 
 import { ErroCompilador } from './erros/erro-compilador';
@@ -361,13 +370,90 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     private mapearTipoJvm(tipoDelegua: string): string {
         const tipoJvm = MAPA_TIPOS_JVM[tipoDelegua];
         if (tipoJvm) return tipoJvm;
-        // Não é primitivo: só resta ser o nome de uma `classe` já registrada (tipo referência).
+        // Coleções: `vetor` e `dicionário`/`tupla` são sempre erasure de `ArrayList`/`HashMap`/
+        // `Object[]` na JVM — o tipo de elemento só existe do lado Delégua (nesta classe),
+        // usado para decidir autobox/unbox e cast em tempo de compilação.
+        if (tipoDelegua.endsWith('[]')) return 'Ljava/util/ArrayList;';
+        if (tipoDelegua.startsWith('dicionario<')) return 'Ljava/util/HashMap;';
+        if (tipoDelegua.startsWith('tupla<')) return '[Ljava/lang/Object;';
+        // Não é primitivo nem coleção: só resta ser o nome de uma `classe` já registrada.
         if (this.classes.has(tipoDelegua)) return `L${tipoDelegua};`;
         throw new ErroCompilador(`Tipo '${tipoDelegua}' não implementado para JVM.`);
     }
 
     private ehTipoReferencia(tipoJvm: string): boolean {
-        return tipoJvm.startsWith('L') && tipoJvm.endsWith(';');
+        return tipoJvm.startsWith('[') || (tipoJvm.startsWith('L') && tipoJvm.endsWith(';'));
+    }
+
+    /** Nome interno pra `checkcast`/`instanceof` a partir de um descritor JVM de referência. */
+    private nomeInternoDoTipoJvm(tipoJvm: string): string {
+        if (tipoJvm.startsWith('[')) return tipoJvm;
+        if (tipoJvm.startsWith('L') && tipoJvm.endsWith(';')) return tipoJvm.slice(1, -1);
+        throw new ErroCompilador(`Tipo '${tipoJvm}' não é referência: não é possível fazer cast.`);
+    }
+
+    /** Empilha o valor primitivo já presente no topo da pilha como seu wrapper (`Integer`/`Double`/`Boolean`); tipos referência não precisam de nada. */
+    private emitirBoxing(tipoJvm: string): void {
+        switch (tipoJvm) {
+            case 'I':
+                this.instrucoes.push('invokestatic java/lang/Integer/valueOf(I)Ljava/lang/Integer;');
+                break;
+            case 'D':
+                this.instrucoes.push('invokestatic java/lang/Double/valueOf(D)Ljava/lang/Double;');
+                break;
+            case 'Z':
+                this.instrucoes.push('invokestatic java/lang/Boolean/valueOf(Z)Ljava/lang/Boolean;');
+                break;
+        }
+    }
+
+    /** Converte um `Ljava/lang/Object;` (vindo de `List.get`/`Map.get`/`aaload`) pro tipo JVM de destino. */
+    private emitirUnboxDeObjeto(tipoJvmDestino: string): void {
+        switch (tipoJvmDestino) {
+            case 'I':
+                this.instrucoes.push('checkcast java/lang/Integer');
+                this.instrucoes.push('invokevirtual java/lang/Integer/intValue()I');
+                break;
+            case 'D':
+                this.instrucoes.push('checkcast java/lang/Double');
+                this.instrucoes.push('invokevirtual java/lang/Double/doubleValue()D');
+                break;
+            case 'Z':
+                this.instrucoes.push('checkcast java/lang/Boolean');
+                this.instrucoes.push('invokevirtual java/lang/Boolean/booleanValue()Z');
+                break;
+            default:
+                this.instrucoes.push(`checkcast ${this.nomeInternoDoTipoJvm(tipoJvmDestino)}`);
+        }
+    }
+
+    private dividirTiposTupla(tipoTupla: string): string[] {
+        // "tupla<inteiro,texto,logico>" -> ['inteiro','texto','logico']. Seguro porque nenhum
+        // tipo elementar (nem vetor, que usa só sufixo `[]`) contém vírgula.
+        return tipoTupla.slice('tupla<'.length, -1).split(',');
+    }
+
+    private resolverIndiceConstante(indice: any): number {
+        if (indice instanceof Literal && typeof indice.valor === 'number' && Number.isInteger(indice.valor)) {
+            return indice.valor;
+        }
+        throw new ErroCompilador('Acesso a elemento de tupla exige índice inteiro literal (constante em tempo de compilação).');
+    }
+
+    private extrairElementosDeTupla(construto: any): any[] {
+        const nomesOrdinais = ['primeiro', 'segundo', 'terceiro', 'quarto', 'quinto', 'sexto', 'setimo', 'oitavo', 'nono', 'decimo'];
+        const elementos: any[] = [];
+        for (const nome of nomesOrdinais) {
+            if (construto[nome] === undefined) break;
+            elementos.push(construto[nome]);
+        }
+        return elementos;
+    }
+
+    private reservarSlotTemporario(tipoJvm: string): number {
+        const slot = this.proximoSlot;
+        this.proximoSlot += tipoJvm === 'D' ? 2 : 1;
+        return slot;
     }
 
     private resolverTipoConstruto(construto: any): string {
@@ -420,7 +506,77 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         if (construto instanceof Chamada) {
             return this.resolverTipoChamada(construto);
         }
+        if (construto instanceof Vetor) {
+            const elementos = construto.elementos;
+            if (elementos.length === 0) {
+                throw new ErroCompilador('Vetor vazio precisa de contexto de tipo explícito (ainda não suportado).');
+            }
+            return `${this.resolverTipoConstruto(elementos[0])}[]`;
+        }
+        if (construto instanceof Dicionario) {
+            if (construto.valores.length === 0) {
+                throw new ErroCompilador('Dicionário vazio precisa de contexto de tipo explícito (ainda não suportado).');
+            }
+            return `dicionario<${this.resolverTipoConstruto(construto.valores[0])}>`;
+        }
+        // `TuplaN` estende `Tupla`: precisa vir antes da checagem genérica de `Tupla`.
+        if (construto instanceof TuplaN) {
+            return `tupla<${construto.elementos.map((elemento: any) => this.resolverTipoConstruto(elemento)).join(',')}>`;
+        }
+        if (construto instanceof Tupla) {
+            const elementos = this.extrairElementosDeTupla(construto);
+            return `tupla<${elementos.map((elemento) => this.resolverTipoConstruto(elemento)).join(',')}>`;
+        }
+        if (construto instanceof AcessoIndiceVariavel) {
+            const tipoColecao = this.resolverTipoConstruto(construto.entidadeChamada);
+            return this.resolverTipoElementoColecao(tipoColecao, construto.indice);
+        }
+        if (construto instanceof AcessoIntervaloVariavel) {
+            const tipoColecao = this.resolverTipoConstruto(construto.entidadeChamada);
+            if (!tipoColecao.endsWith('[]')) {
+                throw new ErroCompilador(`Fatiamento só é suportado em vetor (tipo '${tipoColecao}').`);
+            }
+            return tipoColecao;
+        }
+        if (construto instanceof AcessoElementoMatriz) {
+            const tipoColecao = this.resolverTipoConstruto(construto.entidadeChamada);
+            return this.resolverTipoElementoMatriz(tipoColecao);
+        }
         throw new ErroCompilador('Não foi possível resolver o tipo da expressão.');
+    }
+
+    private resolverTipoElementoColecao(tipoColecao: string, indice: any): string {
+        if (tipoColecao.endsWith('[]')) return tipoColecao.slice(0, -2);
+        if (tipoColecao.startsWith('dicionario<')) return tipoColecao.slice('dicionario<'.length, -1);
+        if (tipoColecao.startsWith('tupla<')) {
+            const indiceConstante = this.resolverIndiceConstante(indice);
+            const tipos = this.dividirTiposTupla(tipoColecao);
+            if (indiceConstante < 0 || indiceConstante >= tipos.length) {
+                throw new ErroCompilador(`Índice ${indiceConstante} fora dos limites da tupla '${tipoColecao}'.`);
+            }
+            return tipos[indiceConstante];
+        }
+        throw new ErroCompilador(`Tipo '${tipoColecao}' não suporta acesso por índice.`);
+    }
+
+    private resolverTipoElementoParaEscrita(tipoColecao: string): string {
+        if (tipoColecao.endsWith('[]')) return tipoColecao.slice(0, -2);
+        if (tipoColecao.startsWith('dicionario<')) return tipoColecao.slice('dicionario<'.length, -1);
+        if (tipoColecao.startsWith('tupla<')) {
+            throw new ErroCompilador('Tupla é imutável: atribuição por índice não é suportada.');
+        }
+        throw new ErroCompilador(`Tipo '${tipoColecao}' não suporta atribuição por índice.`);
+    }
+
+    private resolverTipoElementoMatriz(tipoColecao: string): string {
+        if (!tipoColecao.endsWith('[]')) {
+            throw new ErroCompilador(`Acesso de matriz exige vetor de vetor (tipo '${tipoColecao}').`);
+        }
+        const tipoLinha = tipoColecao.slice(0, -2);
+        if (!tipoLinha.endsWith('[]')) {
+            throw new ErroCompilador(`Acesso de matriz exige vetor de vetor com 2 níveis ('${tipoColecao}' só tem 1).`);
+        }
+        return tipoLinha.slice(0, -2);
     }
 
     private resolverTipoChamada(expressao: Chamada): string {
@@ -1266,5 +1422,274 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.instrucoes.push(`putfield ${nomeClasseOrigem}/${expressao.nome.lexema} ${campo.tipoJvm}`);
 
         return campo.tipoDelegua;
+    }
+
+    async visitarExpressaoVetor(expressao: Vetor): Promise<string> {
+        const elementos = expressao.elementos;
+        if (elementos.length === 0) {
+            throw new ErroCompilador('Vetor vazio precisa de contexto de tipo explícito (ainda não suportado).');
+        }
+
+        const tipoElemento = this.resolverTipoConstruto(elementos[0]);
+        for (const elemento of elementos) {
+            const tipoAtual = this.resolverTipoConstruto(elemento);
+            if (tipoAtual !== tipoElemento) {
+                throw new ErroCompilador(`Vetor com elementos de tipos diferentes ('${tipoElemento}' e '${tipoAtual}') não é suportado.`);
+            }
+        }
+        const tipoJvmElemento = this.mapearTipoJvm(tipoElemento);
+
+        this.instrucoes.push('new java/util/ArrayList');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('invokespecial java/util/ArrayList/<init>()V');
+
+        for (const elemento of elementos) {
+            this.instrucoes.push('dup');
+            await elemento.aceitar(this as any);
+            this.emitirBoxing(tipoJvmElemento);
+            this.instrucoes.push('invokeinterface java/util/List/add(Ljava/lang/Object;)Z 2');
+            this.instrucoes.push('pop');
+        }
+
+        return `${tipoElemento}[]`;
+    }
+
+    async visitarExpressaoDicionario(expressao: Dicionario): Promise<string> {
+        if (expressao.valores.length === 0) {
+            throw new ErroCompilador('Dicionário vazio precisa de contexto de tipo explícito (ainda não suportado).');
+        }
+        for (const chave of expressao.chaves) {
+            if (!(chave instanceof Literal) || typeof chave.valor !== 'string') {
+                throw new ErroCompilador("Só são suportadas chaves literais de texto em dicionário (ex.: \"chave\": valor).");
+            }
+        }
+
+        const tipoValor = this.resolverTipoConstruto(expressao.valores[0]);
+        for (const valor of expressao.valores) {
+            const tipoAtual = this.resolverTipoConstruto(valor);
+            if (tipoAtual !== tipoValor) {
+                throw new ErroCompilador(`Dicionário com valores de tipos diferentes ('${tipoValor}' e '${tipoAtual}') não é suportado.`);
+            }
+        }
+        const tipoJvmValor = this.mapearTipoJvm(tipoValor);
+
+        this.instrucoes.push('new java/util/HashMap');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('invokespecial java/util/HashMap/<init>()V');
+
+        for (let i = 0; i < expressao.valores.length; i++) {
+            this.instrucoes.push('dup');
+            await expressao.chaves[i].aceitar(this as any);
+            await expressao.valores[i].aceitar(this as any);
+            this.emitirBoxing(tipoJvmValor);
+            this.instrucoes.push('invokevirtual java/util/HashMap/put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;');
+            this.instrucoes.push('pop');
+        }
+
+        return `dicionario<${tipoValor}>`;
+    }
+
+    async visitarExpressaoTuplaN(expressao: TuplaN): Promise<string> {
+        return await this.compilarTupla(expressao.elementos);
+    }
+
+    async visitarExpressaoTupla(expressao: Tupla): Promise<string> {
+        return await this.compilarTupla(this.extrairElementosDeTupla(expressao));
+    }
+
+    private async compilarTupla(elementos: any[]): Promise<string> {
+        const tipos: string[] = [];
+
+        this.instrucoes.push(`ldc ${elementos.length}`);
+        this.instrucoes.push('anewarray java/lang/Object');
+
+        for (let i = 0; i < elementos.length; i++) {
+            const tipoElemento = this.resolverTipoConstruto(elementos[i]);
+            tipos.push(tipoElemento);
+            const tipoJvmElemento = this.mapearTipoJvm(tipoElemento);
+
+            this.instrucoes.push('dup');
+            this.instrucoes.push(`ldc ${i}`);
+            await elementos[i].aceitar(this as any);
+            this.emitirBoxing(tipoJvmElemento);
+            this.instrucoes.push('aastore');
+        }
+
+        return `tupla<${tipos.join(',')}>`;
+    }
+
+    async visitarExpressaoAcessoIndiceVariavel(expressao: AcessoIndiceVariavel): Promise<string> {
+        const tipoColecao = this.resolverTipoConstruto(expressao.entidadeChamada);
+        const tipoElemento = this.resolverTipoElementoColecao(tipoColecao, expressao.indice);
+        const tipoJvmElemento = this.mapearTipoJvm(tipoElemento);
+
+        await expressao.entidadeChamada.aceitar(this as any);
+
+        if (tipoColecao.endsWith('[]')) {
+            const tipoIndice = this.resolverTipoConstruto(expressao.indice);
+            if (tipoIndice !== 'inteiro') throw new ErroCompilador('Índice de vetor precisa ser inteiro.');
+            await expressao.indice.aceitar(this as any);
+            this.instrucoes.push('invokevirtual java/util/ArrayList/get(I)Ljava/lang/Object;');
+        } else if (tipoColecao.startsWith('dicionario<')) {
+            const tipoIndice = this.resolverTipoConstruto(expressao.indice);
+            if (tipoIndice !== 'texto') throw new ErroCompilador('Chave de dicionário precisa ser texto (única forma suportada).');
+            await expressao.indice.aceitar(this as any);
+            this.instrucoes.push('invokevirtual java/util/HashMap/get(Ljava/lang/Object;)Ljava/lang/Object;');
+        } else if (tipoColecao.startsWith('tupla<')) {
+            const indiceConstante = this.resolverIndiceConstante(expressao.indice);
+            this.instrucoes.push(`ldc ${indiceConstante}`);
+            this.instrucoes.push('aaload');
+        } else {
+            throw new ErroCompilador(`Tipo '${tipoColecao}' não suporta acesso por índice.`);
+        }
+
+        this.emitirUnboxDeObjeto(tipoJvmElemento);
+        return tipoElemento;
+    }
+
+    async visitarExpressaoAtribuicaoPorIndice(expressao: AtribuicaoPorIndice): Promise<string> {
+        const tipoColecao = this.resolverTipoConstruto(expressao.objeto);
+        const tipoElemento = this.resolverTipoElementoParaEscrita(tipoColecao);
+        const tipoJvmElemento = this.mapearTipoJvm(tipoElemento);
+
+        await expressao.objeto.aceitar(this as any);
+
+        if (tipoColecao.endsWith('[]')) {
+            const tipoIndice = this.resolverTipoConstruto(expressao.indice);
+            if (tipoIndice !== 'inteiro') throw new ErroCompilador('Índice de vetor precisa ser inteiro.');
+            await expressao.indice.aceitar(this as any);
+            const tipoValor = await expressao.valor.aceitar(this as any);
+            if (tipoValor === 'inteiro' && tipoElemento === 'numero') this.instrucoes.push('i2d');
+            this.emitirBoxing(tipoJvmElemento);
+            this.instrucoes.push('invokevirtual java/util/ArrayList/set(ILjava/lang/Object;)Ljava/lang/Object;');
+            this.instrucoes.push('pop');
+        } else {
+            const tipoIndice = this.resolverTipoConstruto(expressao.indice);
+            if (tipoIndice !== 'texto') throw new ErroCompilador('Chave de dicionário precisa ser texto (única forma suportada).');
+            await expressao.indice.aceitar(this as any);
+            const tipoValor = await expressao.valor.aceitar(this as any);
+            if (tipoValor === 'inteiro' && tipoElemento === 'numero') this.instrucoes.push('i2d');
+            this.emitirBoxing(tipoJvmElemento);
+            this.instrucoes.push('invokevirtual java/util/HashMap/put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;');
+            this.instrucoes.push('pop');
+        }
+
+        return 'vazio';
+    }
+
+    async visitarExpressaoAcessoElementoMatriz(expressao: AcessoElementoMatriz): Promise<string> {
+        const tipoColecao = this.resolverTipoConstruto(expressao.entidadeChamada);
+        const tipoLinha = tipoColecao.slice(0, -2);
+        const tipoElemento = this.resolverTipoElementoMatriz(tipoColecao);
+        const tipoJvmLinha = this.mapearTipoJvm(tipoLinha);
+        const tipoJvmElemento = this.mapearTipoJvm(tipoElemento);
+
+        await expressao.entidadeChamada.aceitar(this as any);
+        await expressao.indicePrimario.aceitar(this as any);
+        this.instrucoes.push('invokevirtual java/util/ArrayList/get(I)Ljava/lang/Object;');
+        this.emitirUnboxDeObjeto(tipoJvmLinha);
+
+        await expressao.indiceSecundario.aceitar(this as any);
+        this.instrucoes.push('invokevirtual java/util/ArrayList/get(I)Ljava/lang/Object;');
+        this.emitirUnboxDeObjeto(tipoJvmElemento);
+
+        return tipoElemento;
+    }
+
+    async visitarExpressaoAtribuicaoPorIndicesMatriz(expressao: AtribuicaoPorIndicesMatriz): Promise<string> {
+        const tipoColecao = this.resolverTipoConstruto(expressao.objeto);
+        const tipoLinha = tipoColecao.slice(0, -2);
+        const tipoElemento = this.resolverTipoElementoMatriz(tipoColecao);
+        const tipoJvmLinha = this.mapearTipoJvm(tipoLinha);
+        const tipoJvmElemento = this.mapearTipoJvm(tipoElemento);
+
+        await expressao.objeto.aceitar(this as any);
+        await expressao.indicePrimario.aceitar(this as any);
+        this.instrucoes.push('invokevirtual java/util/ArrayList/get(I)Ljava/lang/Object;');
+        this.emitirUnboxDeObjeto(tipoJvmLinha);
+
+        await expressao.indiceSecundario.aceitar(this as any);
+        const tipoValor = await expressao.valor.aceitar(this as any);
+        if (tipoValor === 'inteiro' && tipoElemento === 'numero') this.instrucoes.push('i2d');
+        this.emitirBoxing(tipoJvmElemento);
+        this.instrucoes.push('invokevirtual java/util/ArrayList/set(ILjava/lang/Object;)Ljava/lang/Object;');
+        this.instrucoes.push('pop');
+
+        return 'vazio';
+    }
+
+    // Fatiamento (`v[inicio:fim:passo]`) não tem equivalente nativo na JVM: gera um laço que
+    // copia elementos de `origem` pra um `ArrayList` novo. Limitação: assume `passo` positivo
+    // (fatiamento em ordem reversa com passo negativo não é suportado).
+    async visitarExpressaoAcessoIntervaloVariavel(expressao: AcessoIntervaloVariavel): Promise<string> {
+        const tipoColecao = this.resolverTipoConstruto(expressao.entidadeChamada);
+        if (!tipoColecao.endsWith('[]')) {
+            throw new ErroCompilador(`Fatiamento só é suportado em vetor (tipo '${tipoColecao}').`);
+        }
+
+        const slotOrigem = this.reservarSlotTemporario('Ljava/util/ArrayList;');
+        const slotResultado = this.reservarSlotTemporario('Ljava/util/ArrayList;');
+        const slotInicio = this.reservarSlotTemporario('I');
+        const slotFim = this.reservarSlotTemporario('I');
+        const slotPasso = this.reservarSlotTemporario('I');
+        const slotIndice = this.reservarSlotTemporario('I');
+
+        await expressao.entidadeChamada.aceitar(this as any);
+        this.instrucoes.push(`astore ${slotOrigem}`);
+
+        this.instrucoes.push('new java/util/ArrayList');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('invokespecial java/util/ArrayList/<init>()V');
+        this.instrucoes.push(`astore ${slotResultado}`);
+
+        if (expressao.indiceInicio) {
+            await expressao.indiceInicio.aceitar(this as any);
+        } else {
+            this.instrucoes.push('iconst_0');
+        }
+        this.instrucoes.push(`istore ${slotInicio}`);
+
+        if (expressao.indiceFim) {
+            await expressao.indiceFim.aceitar(this as any);
+        } else {
+            this.instrucoes.push(`aload ${slotOrigem}`);
+            this.instrucoes.push('invokevirtual java/util/ArrayList/size()I');
+        }
+        this.instrucoes.push(`istore ${slotFim}`);
+
+        if (expressao.indicePasso) {
+            await expressao.indicePasso.aceitar(this as any);
+        } else {
+            this.instrucoes.push('iconst_1');
+        }
+        this.instrucoes.push(`istore ${slotPasso}`);
+
+        this.instrucoes.push(`iload ${slotInicio}`);
+        this.instrucoes.push(`istore ${slotIndice}`);
+
+        const rotuloInicio = this.gerarRotulo('Lfatiar_inicio');
+        const rotuloFim = this.gerarRotulo('Lfatiar_fim');
+
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotFim}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.instrucoes.push(`aload ${slotResultado}`);
+        this.instrucoes.push(`aload ${slotOrigem}`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push('invokevirtual java/util/ArrayList/get(I)Ljava/lang/Object;');
+        this.instrucoes.push('invokeinterface java/util/List/add(Ljava/lang/Object;)Z 2');
+        this.instrucoes.push('pop');
+
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotPasso}`);
+        this.instrucoes.push('iadd');
+        this.instrucoes.push(`istore ${slotIndice}`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+
+        this.instrucoes.push(`aload ${slotResultado}`);
+        return tipoColecao;
     }
 }

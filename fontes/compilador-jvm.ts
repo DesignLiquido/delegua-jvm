@@ -2,6 +2,7 @@ import {
     AcessoElementoMatriz,
     AcessoIndiceVariavel,
     AcessoIntervaloVariavel,
+    AcessoMetodo,
     AcessoMetodoOuPropriedade,
     Agrupamento,
     Atribuir,
@@ -20,6 +21,7 @@ import {
     Escolha,
     Escreva,
     Expressao,
+    FormatacaoEscrita,
     FuncaoDeclaracao,
     Isto,
     Lexador,
@@ -101,6 +103,35 @@ const MAPA_TIPOS_JVM: Record<string, string> = {
     numero: 'D',
     logico: 'Z',
     texto: 'Ljava/lang/String;',
+};
+
+// Tipo Delégua de retorno de cada primitiva de `texto` (nomes em `bibliotecas/primitivas-texto.js`
+// de @designliquido/delegua, incluindo variantes com acento).
+const RETORNOS_METODOS_TEXTO: Record<string, string> = {
+    aparar: 'texto',
+    apararFim: 'texto',
+    apararInicio: 'texto',
+    apararInício: 'texto',
+    concatenar: 'texto',
+    dividir: 'texto[]',
+    encontrar: 'inteiro',
+    fatiar: 'texto',
+    inclui: 'logico',
+    inverter: 'texto',
+    maiusculo: 'texto',
+    maiúsculo: 'texto',
+    minusculo: 'texto',
+    minúsculo: 'texto',
+    particao: 'tupla<texto,texto,texto>',
+    partição: 'tupla<texto,texto,texto>',
+    substituir: 'texto',
+    subtexto: 'texto',
+    tamanho: 'inteiro',
+    terminaCom: 'logico',
+    tudoMaiusculo: 'logico',
+    tudoMaiúsculo: 'logico',
+    tudoMinusculo: 'logico',
+    tudoMinúsculo: 'logico',
 };
 
 /**
@@ -594,7 +625,20 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             }
             return resolvido.metodo.tipoRetornoDelegua;
         }
+        if (expressao.entidadeChamada instanceof AcessoMetodo) {
+            return this.resolverTipoRetornoMetodoPrimitivo(expressao.entidadeChamada);
+        }
         return this.resolverInfoFuncaoChamada(expressao).tipoRetornoDelegua;
+    }
+
+    private resolverTipoRetornoMetodoPrimitivo(acesso: AcessoMetodo): string {
+        const tipoObjeto = this.resolverTipoConstruto(acesso.objeto);
+        if (tipoObjeto === 'texto') {
+            const tipoRetorno = RETORNOS_METODOS_TEXTO[acesso.nomeMetodo];
+            if (!tipoRetorno) throw new ErroCompilador(`Método de texto '${acesso.nomeMetodo}' não implementado.`);
+            return tipoRetorno;
+        }
+        throw new ErroCompilador(`Método '${acesso.nomeMetodo}' não implementado para o tipo '${tipoObjeto}'.`);
     }
 
     private resolverInfoFuncaoChamada(expressao: Chamada): FuncaoInfo {
@@ -962,6 +1006,17 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         // `objeto.metodo(args)` ou `super.metodo(args)`.
         if (expressao.entidadeChamada instanceof AcessoMetodoOuPropriedade) {
             return await this.compilarChamadaMetodo(expressao);
+        }
+
+        // Método nativo de tipo primitivo (`"abc".maiusculo()`) — o parser já resolve isso
+        // pra `AcessoMetodo` quando reconhece a primitiva (ver PLAN.md, achado da Fase 6).
+        if (expressao.entidadeChamada instanceof AcessoMetodo) {
+            const acesso = expressao.entidadeChamada;
+            const tipoObjeto = this.resolverTipoConstruto(acesso.objeto);
+            if (tipoObjeto === 'texto') {
+                return await this.compilarMetodoTexto(acesso.objeto, acesso.nomeMetodo, expressao.argumentos);
+            }
+            throw new ErroCompilador(`Método '${acesso.nomeMetodo}' não implementado para o tipo '${tipoObjeto}'.`);
         }
 
         const info = this.resolverInfoFuncaoChamada(expressao);
@@ -1691,5 +1746,294 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
 
         this.instrucoes.push(`aload ${slotResultado}`);
         return tipoColecao;
+    }
+
+    async visitarExpressaoAcessoMetodo(expressao: AcessoMetodo): Promise<any> {
+        // `AcessoMetodo` só é compilado quando embrulhado numa `Chamada` (ver
+        // `visitarExpressaoDeChamada`); referenciar um método sem chamá-lo não é suportado.
+        throw new ErroCompilador(`Referência a método sem chamada ('${expressao.nomeMetodo}') não é suportada.`);
+    }
+
+    // Dispatch das primitivas de `texto` (`bibliotecas/primitivas-texto.js`). `objetoExpr` é
+    // compilado dentro de cada `case` (não antes, de forma genérica) porque a ordem em que a
+    // referência precisa entrar na pilha varia por método (`inverter`, por exemplo, precisa
+    // do `new StringBuilder` antes do texto).
+    private async compilarMetodoTexto(objetoExpr: any, nomeMetodo: string, argumentos: any[]): Promise<string> {
+        const tipoRetorno = RETORNOS_METODOS_TEXTO[nomeMetodo];
+        if (!tipoRetorno) throw new ErroCompilador(`Método de texto '${nomeMetodo}' não implementado.`);
+
+        const exigirArgTexto = async (indice: number, nomeArg: string): Promise<void> => {
+            const tipo = await argumentos[indice].aceitar(this as any);
+            if (tipo !== 'texto') throw new ErroCompilador(`'${nomeArg}' de '${nomeMetodo}' precisa ser texto.`);
+        };
+        const exigirArgInteiro = async (indice: number, nomeArg: string): Promise<void> => {
+            const tipo = await argumentos[indice].aceitar(this as any);
+            if (tipo !== 'inteiro') throw new ErroCompilador(`'${nomeArg}' de '${nomeMetodo}' precisa ser inteiro.`);
+        };
+
+        const SEM_ARGUMENTO: Record<string, string> = {
+            aparar: 'invokevirtual java/lang/String/strip()Ljava/lang/String;',
+            apararFim: 'invokevirtual java/lang/String/stripTrailing()Ljava/lang/String;',
+            apararInicio: 'invokevirtual java/lang/String/stripLeading()Ljava/lang/String;',
+            apararInício: 'invokevirtual java/lang/String/stripLeading()Ljava/lang/String;',
+            maiusculo: 'invokevirtual java/lang/String/toUpperCase()Ljava/lang/String;',
+            maiúsculo: 'invokevirtual java/lang/String/toUpperCase()Ljava/lang/String;',
+            minusculo: 'invokevirtual java/lang/String/toLowerCase()Ljava/lang/String;',
+            minúsculo: 'invokevirtual java/lang/String/toLowerCase()Ljava/lang/String;',
+            tamanho: 'invokevirtual java/lang/String/length()I',
+        };
+
+        switch (nomeMetodo) {
+            case 'aparar':
+            case 'apararFim':
+            case 'apararInicio':
+            case 'apararInício':
+            case 'maiusculo':
+            case 'maiúsculo':
+            case 'minusculo':
+            case 'minúsculo':
+            case 'tamanho':
+                if (argumentos.length !== 0) throw new ErroCompilador(`'${nomeMetodo}' não recebe argumentos.`);
+                await objetoExpr.aceitar(this as any);
+                this.instrucoes.push(SEM_ARGUMENTO[nomeMetodo]);
+                break;
+
+            case 'tudoMaiusculo':
+            case 'tudoMaiúsculo':
+            case 'tudoMinusculo':
+            case 'tudoMinúsculo': {
+                if (argumentos.length !== 0) throw new ErroCompilador(`'${nomeMetodo}' não recebe argumentos.`);
+                const slot = this.reservarSlotTemporario('Ljava/lang/String;');
+                await objetoExpr.aceitar(this as any);
+                this.instrucoes.push(`astore ${slot}`);
+                this.instrucoes.push(`aload ${slot}`);
+                this.instrucoes.push(`aload ${slot}`);
+                const ehMaiusculo = nomeMetodo.startsWith('tudoMai');
+                this.instrucoes.push(`invokevirtual java/lang/String/${ehMaiusculo ? 'toUpperCase' : 'toLowerCase'}()Ljava/lang/String;`);
+                this.instrucoes.push('invokevirtual java/lang/String/equals(Ljava/lang/Object;)Z');
+                break;
+            }
+
+            case 'inverter':
+                if (argumentos.length !== 0) throw new ErroCompilador("'inverter' não recebe argumentos.");
+                this.instrucoes.push('new java/lang/StringBuilder');
+                this.instrucoes.push('dup');
+                await objetoExpr.aceitar(this as any);
+                this.instrucoes.push('invokespecial java/lang/StringBuilder/<init>(Ljava/lang/String;)V');
+                this.instrucoes.push('invokevirtual java/lang/StringBuilder/reverse()Ljava/lang/StringBuilder;');
+                this.instrucoes.push('invokevirtual java/lang/StringBuilder/toString()Ljava/lang/String;');
+                break;
+
+            case 'concatenar':
+                await objetoExpr.aceitar(this as any);
+                for (let i = 0; i < argumentos.length; i++) {
+                    await exigirArgTexto(i, 'outroTexto');
+                    this.instrucoes.push('invokevirtual java/lang/String/concat(Ljava/lang/String;)Ljava/lang/String;');
+                }
+                break;
+
+            case 'inclui':
+                if (argumentos.length !== 1) throw new ErroCompilador("'inclui' espera 1 argumento.");
+                await objetoExpr.aceitar(this as any);
+                await exigirArgTexto(0, 'elemento');
+                this.instrucoes.push('invokevirtual java/lang/String/contains(Ljava/lang/CharSequence;)Z');
+                break;
+
+            case 'terminaCom':
+                if (argumentos.length !== 1) throw new ErroCompilador("'terminaCom' espera 1 argumento.");
+                await objetoExpr.aceitar(this as any);
+                await exigirArgTexto(0, 'sufixo');
+                this.instrucoes.push('invokevirtual java/lang/String/endsWith(Ljava/lang/String;)Z');
+                break;
+
+            case 'substituir':
+                if (argumentos.length !== 2) throw new ErroCompilador("'substituir' espera 2 argumentos.");
+                await objetoExpr.aceitar(this as any);
+                await exigirArgTexto(0, 'textoASerSubstituido');
+                await exigirArgTexto(1, 'substituto');
+                this.instrucoes.push(
+                    'invokevirtual java/lang/String/replace(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;'
+                );
+                break;
+
+            case 'encontrar':
+                if (argumentos.length < 1 || argumentos.length > 2) throw new ErroCompilador("'encontrar' espera 1 ou 2 argumentos.");
+                await objetoExpr.aceitar(this as any);
+                await exigirArgTexto(0, 'subtexto');
+                if (argumentos.length === 2) {
+                    await exigirArgInteiro(1, 'indiceInicio');
+                    this.instrucoes.push('invokevirtual java/lang/String/indexOf(Ljava/lang/String;I)I');
+                } else {
+                    this.instrucoes.push('invokevirtual java/lang/String/indexOf(Ljava/lang/String;)I');
+                }
+                break;
+
+            case 'fatiar':
+                if (argumentos.length < 1 || argumentos.length > 2) throw new ErroCompilador("'fatiar' espera 1 ou 2 argumentos.");
+                await objetoExpr.aceitar(this as any);
+                await exigirArgInteiro(0, 'inicio');
+                if (argumentos.length === 2) {
+                    await exigirArgInteiro(1, 'fim');
+                    this.instrucoes.push('invokevirtual java/lang/String/substring(II)Ljava/lang/String;');
+                } else {
+                    this.instrucoes.push('invokevirtual java/lang/String/substring(I)Ljava/lang/String;');
+                }
+                break;
+
+            case 'subtexto':
+                if (argumentos.length !== 2) throw new ErroCompilador("'subtexto' espera 2 argumentos.");
+                await objetoExpr.aceitar(this as any);
+                await exigirArgInteiro(0, 'inicio');
+                await exigirArgInteiro(1, 'fim');
+                this.instrucoes.push('invokevirtual java/lang/String/substring(II)Ljava/lang/String;');
+                break;
+
+            case 'dividir': {
+                if (argumentos.length < 1 || argumentos.length > 2) throw new ErroCompilador("'dividir' espera 1 ou 2 argumentos.");
+                const slotArray = this.reservarSlotTemporario('[Ljava/lang/String;');
+                await objetoExpr.aceitar(this as any);
+                await exigirArgTexto(0, 'delimitador');
+                if (argumentos.length === 2) {
+                    await exigirArgInteiro(1, 'limite');
+                    this.instrucoes.push('invokevirtual java/lang/String/split(Ljava/lang/String;I)[Ljava/lang/String;');
+                } else {
+                    this.instrucoes.push('invokevirtual java/lang/String/split(Ljava/lang/String;)[Ljava/lang/String;');
+                }
+                this.instrucoes.push(`astore ${slotArray}`);
+                this.instrucoes.push('new java/util/ArrayList');
+                this.instrucoes.push('dup');
+                this.instrucoes.push(`aload ${slotArray}`);
+                this.instrucoes.push('invokestatic java/util/Arrays/asList([Ljava/lang/Object;)Ljava/util/List;');
+                this.instrucoes.push('invokespecial java/util/ArrayList/<init>(Ljava/util/Collection;)V');
+                break;
+            }
+
+            case 'particao':
+            case 'partição':
+                if (argumentos.length !== 1) throw new ErroCompilador(`'${nomeMetodo}' espera 1 argumento.`);
+                await this.compilarParticao(objetoExpr, argumentos[0]);
+                break;
+
+            default:
+                throw new ErroCompilador(`Método de texto '${nomeMetodo}' não implementado.`);
+        }
+
+        return tipoRetorno;
+    }
+
+    // `texto.particao(separador)` -> `tupla<texto,texto,texto>` = [antes, separador (ou vazio), depois].
+    // Se o separador não é encontrado no texto: [texto, "", ""] (mesma semântica do
+    // `implementacaoParticao` do interpretador, em `bibliotecas/primitivas-texto.js`).
+    private async compilarParticao(objetoExpr: any, separadorExpr: any): Promise<void> {
+        const slotTexto = this.reservarSlotTemporario('Ljava/lang/String;');
+        const slotSeparador = this.reservarSlotTemporario('Ljava/lang/String;');
+        const slotIndice = this.reservarSlotTemporario('I');
+
+        await objetoExpr.aceitar(this as any);
+        this.instrucoes.push(`astore ${slotTexto}`);
+        const tipoSeparador = await separadorExpr.aceitar(this as any);
+        if (tipoSeparador !== 'texto') throw new ErroCompilador("'separador' de 'particao' precisa ser texto.");
+        this.instrucoes.push(`astore ${slotSeparador}`);
+
+        this.instrucoes.push(`aload ${slotTexto}`);
+        this.instrucoes.push(`aload ${slotSeparador}`);
+        this.instrucoes.push('invokevirtual java/lang/String/indexOf(Ljava/lang/String;)I');
+        this.instrucoes.push(`istore ${slotIndice}`);
+
+        const rotuloNaoEncontrado = this.gerarRotulo('Lparticao_naoencontrado');
+        const rotuloFim = this.gerarRotulo('Lparticao_fim');
+
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push('iconst_m1');
+        this.instrucoes.push(`if_icmpeq ${rotuloNaoEncontrado}`);
+
+        this.instrucoes.push('ldc 3');
+        this.instrucoes.push('anewarray java/lang/Object');
+
+        this.instrucoes.push('dup');
+        this.instrucoes.push('iconst_0');
+        this.instrucoes.push(`aload ${slotTexto}`);
+        this.instrucoes.push('iconst_0');
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push('invokevirtual java/lang/String/substring(II)Ljava/lang/String;');
+        this.instrucoes.push('aastore');
+
+        this.instrucoes.push('dup');
+        this.instrucoes.push('iconst_1');
+        this.instrucoes.push(`aload ${slotSeparador}`);
+        this.instrucoes.push('aastore');
+
+        this.instrucoes.push('dup');
+        this.instrucoes.push('iconst_2');
+        this.instrucoes.push(`aload ${slotTexto}`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`aload ${slotSeparador}`);
+        this.instrucoes.push('invokevirtual java/lang/String/length()I');
+        this.instrucoes.push('iadd');
+        this.instrucoes.push(`aload ${slotTexto}`);
+        this.instrucoes.push('invokevirtual java/lang/String/length()I');
+        this.instrucoes.push('invokevirtual java/lang/String/substring(II)Ljava/lang/String;');
+        this.instrucoes.push('aastore');
+
+        this.instrucoes.push(`goto ${rotuloFim}`);
+
+        this.instrucoes.push(`${rotuloNaoEncontrado}:`);
+        this.instrucoes.push('ldc 3');
+        this.instrucoes.push('anewarray java/lang/Object');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('iconst_0');
+        this.instrucoes.push(`aload ${slotTexto}`);
+        this.instrucoes.push('aastore');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('iconst_1');
+        this.instrucoes.push('ldc ""');
+        this.instrucoes.push('aastore');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('iconst_2');
+        this.instrucoes.push('ldc ""');
+        this.instrucoes.push('aastore');
+
+        this.instrucoes.push(`${rotuloFim}:`);
+    }
+
+    // `FormatacaoEscrita` (espaçamento/casas decimais em `escreva`) não é alcançável pelo
+    // parser atual (nenhuma ocorrência de `new construtos_1.FormatacaoEscrita` em
+    // avaliador-sintatico.js) — implementado defensivamente via `String.format`.
+    async visitarExpressaoFormatacaoEscrita(expressao: FormatacaoEscrita): Promise<string> {
+        const tipoExpressao = this.resolverTipoConstruto(expressao.expressao);
+        // O construto usa `-1` como sentinela de "não informado" (`espacos || -1` no próprio
+        // construtor de `FormatacaoEscrita`), não `undefined`.
+        const temCasasDecimais = expressao.casasDecimais !== undefined && expressao.casasDecimais !== null && expressao.casasDecimais >= 0;
+        const temEspacos = expressao.espacos !== undefined && expressao.espacos !== null && expressao.espacos >= 0;
+
+        if (!temCasasDecimais && !temEspacos) {
+            await expressao.expressao.aceitar(this as any);
+            this.converterParaTexto(tipoExpressao);
+            return 'texto';
+        }
+
+        if (temCasasDecimais && tipoExpressao !== 'numero' && tipoExpressao !== 'inteiro') {
+            throw new ErroCompilador("'casasDecimais' de formatação de escrita só se aplica a números.");
+        }
+
+        const especificador = temCasasDecimais
+            ? `%${temEspacos ? expressao.espacos : ''}.${expressao.casasDecimais}f`
+            : `%${expressao.espacos}s`;
+
+        this.instrucoes.push(`ldc "${especificador}"`);
+        this.instrucoes.push('iconst_1');
+        this.instrucoes.push('anewarray java/lang/Object');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('iconst_0');
+        await expressao.expressao.aceitar(this as any);
+        if (temCasasDecimais) {
+            if (tipoExpressao === 'inteiro') this.instrucoes.push('i2d');
+            this.emitirBoxing('D');
+        } else {
+            this.converterParaTexto(tipoExpressao);
+        }
+        this.instrucoes.push('aastore');
+        this.instrucoes.push('invokestatic java/lang/String/format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;');
+        return 'texto';
     }
 }

@@ -22,6 +22,7 @@ import {
     Escreva,
     Expressao,
     FormatacaoEscrita,
+    FuncaoConstruto,
     FuncaoDeclaracao,
     Isto,
     Lexador,
@@ -161,6 +162,8 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     private classeAtual: InfoClasse | null;
     // Uma classe Delégua vira um `.class` Jasmin à parte (não cabe no `.j` de `Programa`).
     private classesGeradas: Map<string, string>;
+    // Contador pra nomear as classes auxiliares de função anônima (`Lambda0`, `Lambda1`, ...).
+    private proximoIdLambda: number;
 
     constructor() {
         super();
@@ -183,6 +186,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.classes = new Map();
         this.classeAtual = null;
         this.classesGeradas = new Map();
+        this.proximoIdLambda = 0;
 
         const retornoLexador = this.lexador.mapear(codigo, -1);
         const retornoAvaliadorSintatico: any = await this.avaliadorSintatico.analisar(retornoLexador, -1);
@@ -370,6 +374,17 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         return null;
     }
 
+    // Resolve o tipo Delégua de um nome de identificador: primeiro como variável/parâmetro
+    // local (`this.variaveis`), senão como campo capturado da lambda sendo compilada agora
+    // (`this.classeAtual`, quando estamos dentro de um `invocar` de função anônima).
+    private resolverTipoDeNomeVariavelOuCampo(nome: string): string {
+        const local = this.variaveis.get(nome);
+        if (local) return local.tipoDelegua;
+        const campo = this.classeAtual?.campos.get(nome);
+        if (campo) return campo.tipoDelegua;
+        throw new ErroCompilador(`Variável '${nome}' não declarada.`);
+    }
+
     private montarModulo(): string {
         const corpo = this.instrucoes.map((instrucao) => `        ${instrucao}`).join('\n');
         const metodosExtras = this.metodosGerados.length ? '\n' + this.metodosGerados.join('\n') : '';
@@ -498,9 +513,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             throw new ErroCompilador('Não foi possível deduzir o tipo do literal.');
         }
         if (construto instanceof Variavel) {
-            const local = this.variaveis.get(construto.simbolo.lexema);
-            if (!local) throw new ErroCompilador(`Variável '${construto.simbolo.lexema}' não declarada.`);
-            return local.tipoDelegua;
+            return this.resolverTipoDeNomeVariavelOuCampo(construto.simbolo.lexema);
         }
         if (construto instanceof Binario) {
             if (OPERADORES_COMPARACAO.includes(construto.operador.tipo)) return 'logico';
@@ -628,6 +641,16 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         if (expressao.entidadeChamada instanceof AcessoMetodo) {
             return this.resolverTipoRetornoMetodoPrimitivo(expressao.entidadeChamada);
         }
+        // Chamar uma variável local/parâmetro/campo capturado (nunca uma função de nível
+        // superior, que fica só em `this.funcoes`): só faz sentido se ela guarda uma função
+        // anônima — o "tipo" dela é o nome da classe auxiliar gerada em
+        // `visitarExpressaoFuncaoConstruto`, que tem um método `invocar`.
+        if (expressao.entidadeChamada instanceof Variavel && this.variaveis.has(expressao.entidadeChamada.simbolo.lexema)) {
+            const nomeClasseLambda = this.resolverTipoConstruto(expressao.entidadeChamada);
+            const metodo = this.classes.get(nomeClasseLambda)?.metodos.get('invocar');
+            if (!metodo) throw new ErroCompilador(`'${expressao.entidadeChamada.simbolo.lexema}' não é uma função anônima chamável.`);
+            return metodo.tipoRetornoDelegua;
+        }
         return this.resolverInfoFuncaoChamada(expressao).tipoRetornoDelegua;
     }
 
@@ -671,11 +694,19 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         // quando não há anotação explícita — e sofre da mesma generalização de
         // 'número' descrita em `resolverTipoConstruto`. Só confia nele quando o
         // usuário anotou o tipo explicitamente (`var x: inteiro = 10`).
-        const tipoDelegua = declaracao.tipoExplicito
-            ? this.normalizarTipo(declaracao.tipo)
-            : this.resolverTipoConstruto(declaracao.inicializador);
-
-        await declaracao.inicializador.aceitar(this as any);
+        let tipoDelegua: string;
+        if (declaracao.tipoExplicito) {
+            tipoDelegua = this.normalizarTipo(declaracao.tipo);
+            await declaracao.inicializador.aceitar(this as any);
+        } else if (declaracao.inicializador instanceof FuncaoConstruto) {
+            // Função anônima: o "tipo" é o nome da classe auxiliar gerada ao compilar (contador
+            // de lambdas) — não dá pra descobrir isso antes, via `resolverTipoConstruto`, sem
+            // duplicar a análise de captura e dessincronizar o contador.
+            tipoDelegua = await declaracao.inicializador.aceitar(this as any);
+        } else {
+            tipoDelegua = this.resolverTipoConstruto(declaracao.inicializador);
+            await declaracao.inicializador.aceitar(this as any);
+        }
 
         const tipoJvm = this.mapearTipoJvm(tipoDelegua);
         const slot = this.proximoSlot;
@@ -714,11 +745,21 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
 
     async visitarExpressaoDeVariavel(expressao: Variavel): Promise<string> {
         const local = this.variaveis.get(expressao.simbolo.lexema);
-        if (!local) throw new ErroCompilador(`Variável '${expressao.simbolo.lexema}' não declarada.`);
-        if (local.tipoJvm === 'D') this.instrucoes.push(`dload ${local.slot}`);
-        else if (this.ehTipoReferencia(local.tipoJvm)) this.instrucoes.push(`aload ${local.slot}`);
-        else this.instrucoes.push(`iload ${local.slot}`);
-        return local.tipoDelegua;
+        if (local) {
+            if (local.tipoJvm === 'D') this.instrucoes.push(`dload ${local.slot}`);
+            else if (this.ehTipoReferencia(local.tipoJvm)) this.instrucoes.push(`aload ${local.slot}`);
+            else this.instrucoes.push(`iload ${local.slot}`);
+            return local.tipoDelegua;
+        }
+        // Não é uma variável/parâmetro local: só resta ser um campo capturado da lambda sendo
+        // compilada agora (referência a uma variável da função/método que a envolvia).
+        const campo = this.classeAtual?.campos.get(expressao.simbolo.lexema);
+        if (campo) {
+            this.instrucoes.push('aload_0');
+            this.instrucoes.push(`getfield ${this.classeAtual!.nome}/${campo.nome} ${campo.tipoJvm}`);
+            return campo.tipoDelegua;
+        }
+        throw new ErroCompilador(`Variável '${expressao.simbolo.lexema}' não declarada.`);
     }
 
     async visitarExpressaoAgrupamento(expressao: Agrupamento): Promise<string> {
@@ -889,27 +930,55 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         if (!(expressao.operando instanceof Variavel)) {
             throw new ErroCompilador('Incremento/decremento só é suportado em variáveis simples.');
         }
-        const local = this.variaveis.get(expressao.operando.simbolo.lexema);
-        if (!local) throw new ErroCompilador(`Variável '${expressao.operando.simbolo.lexema}' não declarada.`);
-
         const decremento = expressao.operador.tipo === 'DECREMENTAR';
+        const nome = expressao.operando.simbolo.lexema;
+        const local = this.variaveis.get(nome);
 
-        if (local.tipoJvm === 'D') {
-            this.instrucoes.push(`dload ${local.slot}`);
-            this.instrucoes.push('ldc2_w 1.0');
-            this.instrucoes.push(decremento ? 'dsub' : 'dadd');
-            this.instrucoes.push('dup2');
-            this.instrucoes.push(`dstore ${local.slot}`);
-            return local.tipoDelegua;
+        if (local) {
+            if (local.tipoJvm === 'D') {
+                this.instrucoes.push(`dload ${local.slot}`);
+                this.instrucoes.push('ldc2_w 1.0');
+                this.instrucoes.push(decremento ? 'dsub' : 'dadd');
+                this.instrucoes.push('dup2');
+                this.instrucoes.push(`dstore ${local.slot}`);
+                return local.tipoDelegua;
+            }
+            if (local.tipoJvm === 'I') {
+                this.instrucoes.push(`iinc ${local.slot} ${decremento ? -1 : 1}`);
+                this.instrucoes.push(`iload ${local.slot}`);
+                return local.tipoDelegua;
+            }
+            throw new ErroCompilador(`Incremento/decremento não suportado para tipo '${local.tipoDelegua}'.`);
         }
 
-        if (local.tipoJvm === 'I') {
-            this.instrucoes.push(`iinc ${local.slot} ${decremento ? -1 : 1}`);
-            this.instrucoes.push(`iload ${local.slot}`);
-            return local.tipoDelegua;
+        // Campo capturado de lambda: `iinc` só existe pra slots locais, então usa
+        // getfield/putfield (sem semântica de pré/pós-fixado, igual ao caso de slot local).
+        const campo = this.classeAtual?.campos.get(nome);
+        if (campo) {
+            if (campo.tipoJvm === 'D') {
+                this.instrucoes.push('aload_0');
+                this.instrucoes.push('dup');
+                this.instrucoes.push(`getfield ${this.classeAtual!.nome}/${campo.nome} ${campo.tipoJvm}`);
+                this.instrucoes.push('ldc2_w 1.0');
+                this.instrucoes.push(decremento ? 'dsub' : 'dadd');
+                this.instrucoes.push('dup2_x1');
+                this.instrucoes.push(`putfield ${this.classeAtual!.nome}/${campo.nome} ${campo.tipoJvm}`);
+                return campo.tipoDelegua;
+            }
+            if (campo.tipoJvm === 'I') {
+                this.instrucoes.push('aload_0');
+                this.instrucoes.push('dup');
+                this.instrucoes.push(`getfield ${this.classeAtual!.nome}/${campo.nome} ${campo.tipoJvm}`);
+                this.instrucoes.push(decremento ? 'iconst_m1' : 'iconst_1');
+                this.instrucoes.push('iadd');
+                this.instrucoes.push('dup_x1');
+                this.instrucoes.push(`putfield ${this.classeAtual!.nome}/${campo.nome} ${campo.tipoJvm}`);
+                return campo.tipoDelegua;
+            }
+            throw new ErroCompilador(`Incremento/decremento não suportado para tipo '${campo.tipoDelegua}'.`);
         }
 
-        throw new ErroCompilador(`Incremento/decremento não suportado para tipo '${local.tipoDelegua}'.`);
+        throw new ErroCompilador(`Variável '${nome}' não declarada.`);
     }
 
     async visitarDeclaracaoDeExpressao(declaracao: Expressao): Promise<any> {
@@ -927,25 +996,40 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             throw new ErroCompilador(`Operador de atribuição composta '${expressao.simboloOperador.lexema}' ainda não implementado.`);
         }
 
-        const local = this.variaveis.get(expressao.alvo.simbolo.lexema);
-        if (!local) throw new ErroCompilador(`Variável '${expressao.alvo.simbolo.lexema}' não declarada.`);
+        const nome = expressao.alvo.simbolo.lexema;
+        const local = this.variaveis.get(nome);
 
-        const tipoValor = await expressao.valor.aceitar(this as any);
-        if (tipoValor === 'inteiro' && local.tipoDelegua === 'numero') this.instrucoes.push('i2d');
+        if (local) {
+            const tipoValor = await expressao.valor.aceitar(this as any);
+            if (tipoValor === 'inteiro' && local.tipoDelegua === 'numero') this.instrucoes.push('i2d');
 
-        // Deixa o valor atribuído duplicado na pilha: `Atribuir` é uma expressão (ex.: `x = y = 5`).
-        if (local.tipoJvm === 'D') {
-            this.instrucoes.push('dup2');
-            this.instrucoes.push(`dstore ${local.slot}`);
-        } else if (this.ehTipoReferencia(local.tipoJvm)) {
-            this.instrucoes.push('dup');
-            this.instrucoes.push(`astore ${local.slot}`);
-        } else {
-            this.instrucoes.push('dup');
-            this.instrucoes.push(`istore ${local.slot}`);
+            // Deixa o valor atribuído duplicado na pilha: `Atribuir` é uma expressão (ex.: `x = y = 5`).
+            if (local.tipoJvm === 'D') {
+                this.instrucoes.push('dup2');
+                this.instrucoes.push(`dstore ${local.slot}`);
+            } else if (this.ehTipoReferencia(local.tipoJvm)) {
+                this.instrucoes.push('dup');
+                this.instrucoes.push(`astore ${local.slot}`);
+            } else {
+                this.instrucoes.push('dup');
+                this.instrucoes.push(`istore ${local.slot}`);
+            }
+            return local.tipoDelegua;
         }
 
-        return local.tipoDelegua;
+        // Campo capturado de lambda: mesma ideia de `DefinirValor`, mas com `isto` implícito
+        // (o corpo da lambda só tem o nome livre, não `isto.nome`).
+        const campo = this.classeAtual?.campos.get(nome);
+        if (campo) {
+            this.instrucoes.push('aload_0');
+            const tipoValor = await expressao.valor.aceitar(this as any);
+            if (tipoValor === 'inteiro' && campo.tipoDelegua === 'numero') this.instrucoes.push('i2d');
+            this.instrucoes.push(campo.tipoJvm === 'D' ? 'dup2_x1' : 'dup_x1');
+            this.instrucoes.push(`putfield ${this.classeAtual!.nome}/${campo.nome} ${campo.tipoJvm}`);
+            return campo.tipoDelegua;
+        }
+
+        throw new ErroCompilador(`Variável '${nome}' não declarada.`);
     }
 
     async visitarDeclaracaoDefinicaoFuncao(declaracao: FuncaoDeclaracao): Promise<any> {
@@ -1017,6 +1101,15 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
                 return await this.compilarMetodoTexto(acesso.objeto, acesso.nomeMetodo, expressao.argumentos);
             }
             throw new ErroCompilador(`Método '${acesso.nomeMetodo}' não implementado para o tipo '${tipoObjeto}'.`);
+        }
+
+        // Chamar uma variável/parâmetro/campo capturado local (`f(5)`): só pode ser uma função
+        // anônima guardada nela — funções de nível superior nunca entram em `this.variaveis`.
+        // Achado empírico da Fase 7: tanto isso quanto uma chamada de função de nível superior
+        // chegam aqui como `Variavel` puro (`ReferenciaFuncao`/`ArgumentoReferenciaFuncao` nunca
+        // são de fato instanciados pelo parser desta versão — ver PLAN.md).
+        if (expressao.entidadeChamada instanceof Variavel && this.variaveis.has(expressao.entidadeChamada.simbolo.lexema)) {
+            return await this.compilarChamadaLambda(expressao);
         }
 
         const info = this.resolverInfoFuncaoChamada(expressao);
@@ -1093,6 +1186,22 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         const instrucaoInvoke = ehSuper ? 'invokespecial' : 'invokevirtual';
         const nomeClasseParaInvoke = ehSuper ? nomeClasseOrigem : nomeClasseObjeto;
         this.instrucoes.push(`${instrucaoInvoke} ${nomeClasseParaInvoke}/${metodo.nomeJvm}${metodo.descritor}`);
+        return metodo.tipoRetornoDelegua;
+    }
+
+    private async compilarChamadaLambda(expressao: Chamada): Promise<string> {
+        const variavel = expressao.entidadeChamada as Variavel;
+        // `.aceitar()` empilha a referência (variável local ou campo capturado, conforme
+        // `visitarExpressaoDeVariavel`) e devolve seu tipo Delégua — que, pra uma função
+        // anônima, é o nome da classe auxiliar gerada em `visitarExpressaoFuncaoConstruto`.
+        const nomeClasseLambda = (await variavel.aceitar(this as any)) as unknown as string;
+
+        const infoClasseLambda = this.classes.get(nomeClasseLambda);
+        const metodo = infoClasseLambda?.metodos.get('invocar');
+        if (!metodo) throw new ErroCompilador(`'${variavel.simbolo.lexema}' não é uma função anônima chamável.`);
+
+        await this.compilarArgumentos(expressao.argumentos, metodo.parametros, variavel.simbolo.lexema);
+        this.instrucoes.push(`invokevirtual ${nomeClasseLambda}/invocar${metodo.descritor}`);
         return metodo.tipoRetornoDelegua;
     }
 
@@ -2035,5 +2144,200 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.instrucoes.push('aastore');
         this.instrucoes.push('invokestatic java/lang/String/format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;');
         return 'texto';
+    }
+
+    // `funcao(params) {...}` como expressão (não uma declaração `funcao nome(...)`): vira uma
+    // classe auxiliar ("Lambda0", "Lambda1", ...) com um campo por variável capturada e um
+    // método `invocar` — mesma ideia de uma classe de usuário comum (reaproveita `this.classes`,
+    // `buscarCampoComOrigem` etc.), só que gerada pelo compilador em vez de escrita pelo
+    // programador. Tipagem nominal: o "tipo" Delégua do valor resultante É o nome da classe
+    // auxiliar, então uma variável não pode trocar de uma lambda pra outra estruturalmente
+    // diferente (mesma limitação de qualquer variável tipada por classe neste compilador) — e
+    // não há como declarar um parâmetro de função com "tipo de função", já que não existe
+    // anotação de tipo em Delégua pra apontar pra uma classe auxiliar gerada pelo compilador.
+    // Ver PLAN.md para o racional completo (funções de ordem superior genéricas não são
+    // suportadas por causa disso).
+    async visitarExpressaoFuncaoConstruto(expressao: FuncaoConstruto): Promise<string> {
+        const nomeClasse = `Lambda${this.proximoIdLambda++}`;
+
+        const nomesParametros = new Set(expressao.parametros.map((parametro) => parametro.nome.lexema));
+        const nomesDeclaradosLocalmente = new Set<string>();
+        this.coletarNomesDeclaradosLocalmente(expressao.corpo, nomesDeclaradosLocalmente);
+        const nomesReferenciados = new Set<string>();
+        this.coletarNomesDeVariaveisReferenciadas(expressao.corpo, nomesReferenciados);
+
+        const nomesCapturados = [...nomesReferenciados].filter(
+            (nome) => !nomesParametros.has(nome) && !nomesDeclaradosLocalmente.has(nome) && this.variaveis.has(nome)
+        );
+
+        const parametrosLambda: ParametroFuncao[] = expressao.parametros.map((parametro) => {
+            if (!parametro.tipoDado) {
+                throw new ErroCompilador(`Parâmetro '${parametro.nome.lexema}' de função anônima precisa de tipo explícito.`);
+            }
+            const tipoDelegua = this.normalizarTipo(parametro.tipoDado);
+            return { nome: parametro.nome.lexema, tipoDelegua, tipoJvm: this.mapearTipoJvm(tipoDelegua) };
+        });
+
+        const tipoRetornoBruto = expressao.tipo || 'vazio';
+        if (tipoRetornoBruto === 'qualquer') {
+            throw new ErroCompilador('Função anônima precisa de tipo de retorno explícito.');
+        }
+        const tipoRetornoDelegua = tipoRetornoBruto === 'vazio' ? 'vazio' : this.normalizarTipo(tipoRetornoBruto);
+        const tipoRetornoJvm = tipoRetornoDelegua === 'vazio' ? 'V' : this.mapearTipoJvm(tipoRetornoDelegua);
+        const descritorInvocar = `(${parametrosLambda.map((parametro) => parametro.tipoJvm).join('')})${tipoRetornoJvm}`;
+
+        const campos = new Map<string, InfoCampo>();
+        for (const nome of nomesCapturados) {
+            const local = this.variaveis.get(nome)!;
+            campos.set(nome, { nome, tipoDelegua: local.tipoDelegua, tipoJvm: local.tipoJvm });
+        }
+        const construtorParametros: ParametroFuncao[] = nomesCapturados.map((nome) => {
+            const campo = campos.get(nome)!;
+            return { nome: campo.nome, tipoDelegua: campo.tipoDelegua, tipoJvm: campo.tipoJvm };
+        });
+        const descritorConstrutor = `(${construtorParametros.map((parametro) => parametro.tipoJvm).join('')})V`;
+
+        const info: InfoClasse = {
+            nome: nomeClasse,
+            nomeJvmSuper: 'java/lang/Object',
+            campos,
+            metodos: new Map([
+                ['invocar', { nomeJvm: 'invocar', parametros: parametrosLambda, tipoRetornoDelegua, tipoRetornoJvm, descritor: descritorInvocar }],
+            ]),
+            construtor: { nomeJvm: '<init>', parametros: construtorParametros, tipoRetornoDelegua: 'vazio', tipoRetornoJvm: 'V', descritor: descritorConstrutor },
+        };
+        this.classes.set(nomeClasse, info);
+
+        const construtorTexto = this.compilarConstrutorLambda(info);
+        const invocarTexto = await this.compilarMetodoLambda(info, expressao.corpo, parametrosLambda);
+        const camposTexto = Array.from(campos.values())
+            .map((campo) => `.field private final ${campo.nome} ${campo.tipoJvm}`)
+            .join('\n');
+        const classeTexto =
+            `.class public ${nomeClasse}\n` +
+            `.super java/lang/Object\n\n` +
+            (camposTexto ? camposTexto + '\n\n' : '') +
+            construtorTexto +
+            '\n' +
+            invocarTexto;
+        this.classesGeradas.set(nomeClasse, classeTexto);
+
+        // Instancia no ponto de definição: `new Lambda0; dup; <capturas>; invokespecial <init>`.
+        // As capturas são lidas da pilha de variáveis do escopo ENVOLVENTE (ainda não trocamos
+        // pra dentro da lambda) — por isso `iload`/`aload` direto no slot, sem passar por
+        // `visitarExpressaoDeVariavel`.
+        this.instrucoes.push(`new ${nomeClasse}`);
+        this.instrucoes.push('dup');
+        for (const nome of nomesCapturados) {
+            const local = this.variaveis.get(nome)!;
+            if (local.tipoJvm === 'D') this.instrucoes.push(`dload ${local.slot}`);
+            else if (this.ehTipoReferencia(local.tipoJvm)) this.instrucoes.push(`aload ${local.slot}`);
+            else this.instrucoes.push(`iload ${local.slot}`);
+        }
+        this.instrucoes.push(`invokespecial ${nomeClasse}/<init>${descritorConstrutor}`);
+
+        return nomeClasse;
+    }
+
+    private compilarConstrutorLambda(info: InfoClasse): string {
+        const instrucoes: string[] = ['aload_0', 'invokespecial java/lang/Object/<init>()V'];
+        let slot = 1;
+        for (const parametro of info.construtor!.parametros) {
+            instrucoes.push('aload_0');
+            if (parametro.tipoJvm === 'D') instrucoes.push(`dload ${slot}`);
+            else if (this.ehTipoReferencia(parametro.tipoJvm)) instrucoes.push(`aload ${slot}`);
+            else instrucoes.push(`iload ${slot}`);
+            instrucoes.push(`putfield ${info.nome}/${parametro.nome} ${parametro.tipoJvm}`);
+            slot += parametro.tipoJvm === 'D' ? 2 : 1;
+        }
+        instrucoes.push('return');
+
+        const corpoTexto = instrucoes.map((instrucao) => `        ${instrucao}`).join('\n');
+        return (
+            `.method public <init>${info.construtor!.descritor}\n` +
+            `    .limit stack 32\n` +
+            `    .limit locals ${slot}\n` +
+            corpoTexto +
+            '\n' +
+            `.end method\n`
+        );
+    }
+
+    private async compilarMetodoLambda(info: InfoClasse, corpo: Declaracao[], parametros: ParametroFuncao[]): Promise<string> {
+        const metodoInfo = info.metodos.get('invocar')!;
+
+        const instrucoesAnteriores = this.instrucoes;
+        const variaveisAnteriores = this.variaveis;
+        const slotAnterior = this.proximoSlot;
+        const tipoRetornoAnterior = this.tipoRetornoAtual;
+        const classeAnterior = this.classeAtual;
+
+        this.instrucoes = [];
+        this.variaveis = new Map();
+        this.proximoSlot = 1; // slot 0 é a própria instância da lambda (equivalente a `isto`).
+        this.tipoRetornoAtual = metodoInfo.tipoRetornoDelegua;
+        this.classeAtual = info;
+
+        for (const parametro of parametros) {
+            const slot = this.proximoSlot;
+            this.proximoSlot += parametro.tipoJvm === 'D' ? 2 : 1;
+            this.variaveis.set(parametro.nome, { slot, tipoJvm: parametro.tipoJvm, tipoDelegua: parametro.tipoDelegua });
+        }
+
+        for (const decl of corpo) {
+            await decl.aceitar(this as any);
+        }
+        if (metodoInfo.tipoRetornoJvm === 'V') this.instrucoes.push('return');
+
+        const corpoTexto = this.instrucoes.map((instrucao) => `        ${instrucao}`).join('\n');
+        const resultado =
+            `.method public ${metodoInfo.nomeJvm}${metodoInfo.descritor}\n` +
+            `    .limit stack 32\n` +
+            `    .limit locals ${this.proximoSlot}\n` +
+            (corpoTexto ? corpoTexto + '\n' : '') +
+            `.end method\n`;
+
+        this.instrucoes = instrucoesAnteriores;
+        this.variaveis = variaveisAnteriores;
+        this.proximoSlot = slotAnterior;
+        this.tipoRetornoAtual = tipoRetornoAnterior;
+        this.classeAtual = classeAnterior;
+
+        return resultado;
+    }
+
+    // Análise de captura simplificada: percorre genericamente todos os campos do construto/
+    // declaração (em vez de manter uma lista manual por tipo de nó, que ficaria desatualizada
+    // a cada novo construto suportado). Limitação conhecida: não delimita o escopo de uma
+    // função anônima ANINHADA dentro do corpo — nomes locais/parâmetros da lambda interna
+    // entram nos conjuntos da externa também. Fechos aninhados com nomes repetidos podem
+    // capturar errado; não é um caso comum, documentado em PLAN.md.
+    private coletarNomesDeVariaveisReferenciadas(no: any, coletados: Set<string>): void {
+        if (no === null || typeof no !== 'object') return;
+        if (Array.isArray(no)) {
+            for (const item of no) this.coletarNomesDeVariaveisReferenciadas(item, coletados);
+            return;
+        }
+        if (no instanceof Variavel) {
+            coletados.add(no.simbolo.lexema);
+            return;
+        }
+        for (const chave of Object.keys(no)) {
+            this.coletarNomesDeVariaveisReferenciadas(no[chave], coletados);
+        }
+    }
+
+    private coletarNomesDeclaradosLocalmente(no: any, coletados: Set<string>): void {
+        if (no === null || typeof no !== 'object') return;
+        if (Array.isArray(no)) {
+            for (const item of no) this.coletarNomesDeclaradosLocalmente(item, coletados);
+            return;
+        }
+        if (no instanceof Var) {
+            coletados.add(no.simbolo.lexema);
+        }
+        for (const chave of Object.keys(no)) {
+            this.coletarNomesDeclaradosLocalmente(no[chave], coletados);
+        }
     }
 }

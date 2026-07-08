@@ -21,6 +21,7 @@ import {
     Escolha,
     Escreva,
     Expressao,
+    Falhar,
     FormatacaoEscrita,
     FuncaoConstruto,
     FuncaoDeclaracao,
@@ -33,6 +34,7 @@ import {
     Se,
     Super,
     Sustar,
+    Tente,
     Tupla,
     TuplaN,
     Unario,
@@ -164,6 +166,8 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     private classesGeradas: Map<string, string>;
     // Contador pra nomear as classes auxiliares de função anônima (`Lambda0`, `Lambda1`, ...).
     private proximoIdLambda: number;
+    // Diretivas `.catch` (tabela de exceções) do método sendo compilado agora.
+    private catchesGerados: string[];
 
     constructor() {
         super();
@@ -187,6 +191,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.classeAtual = null;
         this.classesGeradas = new Map();
         this.proximoIdLambda = 0;
+        this.catchesGerados = [];
 
         const retornoLexador = this.lexador.mapear(codigo, -1);
         const retornoAvaliadorSintatico: any = await this.avaliadorSintatico.analisar(retornoLexador, -1);
@@ -400,11 +405,17 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             `.method public static main([Ljava/lang/String;)V\n` +
             `    .limit stack 32\n` +
             `    .limit locals ${this.proximoSlot}\n` +
+            this.formatarCatches() +
             (corpo ? corpo + '\n' : '') +
             `        return\n` +
             `.end method\n` +
             metodosExtras
         );
+    }
+
+    /** Diretivas `.catch` (tabela de exceções de `tente`/`pegue`/`finalmente`) do método sendo montado agora. */
+    private formatarCatches(): string {
+        return this.catchesGerados.length ? this.catchesGerados.map((linha) => `    ${linha}`).join('\n') + '\n' : '';
     }
 
     private normalizarTipo(tipo: string): string {
@@ -1042,11 +1053,13 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         const variaveisAnteriores = this.variaveis;
         const slotAnterior = this.proximoSlot;
         const tipoRetornoAnterior = this.tipoRetornoAtual;
+        const catchesAnteriores = this.catchesGerados;
 
         this.instrucoes = [];
         this.variaveis = new Map();
         this.proximoSlot = 0;
         this.tipoRetornoAtual = info.tipoRetornoDelegua;
+        this.catchesGerados = [];
 
         for (const parametro of info.parametros) {
             const slot = this.proximoSlot;
@@ -1066,6 +1079,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             `.method private static ${info.nomeJvm}${info.descritor}\n` +
                 `    .limit stack 32\n` +
                 `    .limit locals ${this.proximoSlot}\n` +
+                this.formatarCatches() +
                 (corpoTexto ? corpoTexto + '\n' : '') +
                 `.end method\n`
         );
@@ -1074,6 +1088,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.variaveis = variaveisAnteriores;
         this.proximoSlot = slotAnterior;
         this.tipoRetornoAtual = tipoRetornoAnterior;
+        this.catchesGerados = catchesAnteriores;
     }
 
     async visitarExpressaoDeChamada(expressao: Chamada): Promise<string> {
@@ -1444,12 +1459,14 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         const slotAnterior = this.proximoSlot;
         const tipoRetornoAnterior = this.tipoRetornoAtual;
         const classeAnterior = this.classeAtual;
+        const catchesAnteriores = this.catchesGerados;
 
         this.instrucoes = [];
         this.variaveis = new Map();
         this.proximoSlot = 1; // slot 0 é `isto`.
         this.tipoRetornoAtual = 'vazio';
         this.classeAtual = info;
+        this.catchesGerados = [];
 
         for (const parametro of info.construtor!.parametros) {
             const slot = this.proximoSlot;
@@ -1484,6 +1501,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             `.method public <init>${info.construtor!.descritor}\n` +
             `    .limit stack 32\n` +
             `    .limit locals ${this.proximoSlot}\n` +
+            this.formatarCatches() +
             corpoTexto +
             '\n' +
             `.end method\n`;
@@ -1493,6 +1511,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.proximoSlot = slotAnterior;
         this.tipoRetornoAtual = tipoRetornoAnterior;
         this.classeAtual = classeAnterior;
+        this.catchesGerados = catchesAnteriores;
 
         return resultado;
     }
@@ -1506,12 +1525,14 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         const slotAnterior = this.proximoSlot;
         const tipoRetornoAnterior = this.tipoRetornoAtual;
         const classeAnterior = this.classeAtual;
+        const catchesAnteriores = this.catchesGerados;
 
         this.instrucoes = [];
         this.variaveis = new Map();
         this.proximoSlot = 1; // slot 0 é `isto`.
         this.tipoRetornoAtual = metodoInfo.tipoRetornoDelegua;
         this.classeAtual = info;
+        this.catchesGerados = [];
 
         for (const parametro of metodoInfo.parametros) {
             const slot = this.proximoSlot;
@@ -1529,6 +1550,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             `.method public ${metodoInfo.nomeJvm}${metodoInfo.descritor}\n` +
             `    .limit stack 32\n` +
             `    .limit locals ${this.proximoSlot}\n` +
+            this.formatarCatches() +
             (corpoTexto ? corpoTexto + '\n' : '') +
             `.end method\n`;
 
@@ -1537,6 +1559,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.proximoSlot = slotAnterior;
         this.tipoRetornoAtual = tipoRetornoAnterior;
         this.classeAtual = classeAnterior;
+        this.catchesGerados = catchesAnteriores;
 
         return resultado;
     }
@@ -2271,12 +2294,14 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         const slotAnterior = this.proximoSlot;
         const tipoRetornoAnterior = this.tipoRetornoAtual;
         const classeAnterior = this.classeAtual;
+        const catchesAnteriores = this.catchesGerados;
 
         this.instrucoes = [];
         this.variaveis = new Map();
         this.proximoSlot = 1; // slot 0 é a própria instância da lambda (equivalente a `isto`).
         this.tipoRetornoAtual = metodoInfo.tipoRetornoDelegua;
         this.classeAtual = info;
+        this.catchesGerados = [];
 
         for (const parametro of parametros) {
             const slot = this.proximoSlot;
@@ -2294,6 +2319,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             `.method public ${metodoInfo.nomeJvm}${metodoInfo.descritor}\n` +
             `    .limit stack 32\n` +
             `    .limit locals ${this.proximoSlot}\n` +
+            this.formatarCatches() +
             (corpoTexto ? corpoTexto + '\n' : '') +
             `.end method\n`;
 
@@ -2301,6 +2327,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.variaveis = variaveisAnteriores;
         this.proximoSlot = slotAnterior;
         this.tipoRetornoAtual = tipoRetornoAnterior;
+        this.catchesGerados = catchesAnteriores;
         this.classeAtual = classeAnterior;
 
         return resultado;
@@ -2338,6 +2365,113 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         }
         for (const chave of Object.keys(no)) {
             this.coletarNomesDeclaradosLocalmente(no[chave], coletados);
+        }
+    }
+
+    // `falhar <expressao>`: só suporta lançar um valor primitivo (convertido pra texto e
+    // embrulhado numa `RuntimeException` — é o único tipo de exceção que este compilador
+    // modela). Lançar uma instância de classe do usuário como exceção não é suportado ainda.
+    async visitarExpressaoFalhar(declaracao: Falhar): Promise<any> {
+        this.instrucoes.push('new java/lang/RuntimeException');
+        this.instrucoes.push('dup');
+        const tipoExplicacao = await declaracao.explicacao.aceitar(this as any);
+        this.converterParaTexto(tipoExplicacao);
+        this.instrucoes.push('invokespecial java/lang/RuntimeException/<init>(Ljava/lang/String;)V');
+        this.instrucoes.push('athrow');
+    }
+
+    // `tente { } pegue (param?) { } senao { } finalmente { }`. Modelo simplificado: só existe
+    // um "tipo" de exceção na JVM gerada (`java/lang/RuntimeException`, o que `falhar` lança),
+    // então só um bloco `pegue` faz sentido (múltiplos `pegue` com o mesmo tipo nunca
+    // alcançariam o segundo em diante) — `tipoExcecao` anotado no `pegue` é ignorado. O
+    // parâmetro capturado (se houver) é ligado à MENSAGEM da exceção (`getMessage()`), sempre
+    // como `texto`, já que não há uma "classe de exceção" navegável no modelo atual.
+    //
+    // `finalmente` é duplicado nos dois pontos de saída normais (sucesso/`senao` e catch
+    // tratado) e tem um terceiro handler `catch Throwable` cobrindo tanto o `tente` quanto o
+    // `pegue`, que roda o `finalmente` e relança — garantindo que ele rode mesmo se a exceção
+    // não for capturada (ou não houver `pegue` nenhum). Limitação conhecida: um `retorna`
+    // dentro do `tente`/`pegue` sai direto (ireturn/dreturn/areturn/return) sem passar pelo
+    // `finalmente` — replicar o `finalmente` antes de cada `retorna` interno exigiria rastrear
+    // "estou dentro de um tente com finalmente" em `visitarExpressaoRetornar`, não implementado
+    // nesta fase.
+    async visitarDeclaracaoTente(declaracao: Tente): Promise<any> {
+        if (declaracao.caminhoPegue.length > 1) {
+            throw new ErroCompilador(
+                "Múltiplos blocos 'pegue' num único 'tente' ainda não são suportados (só há um tipo de exceção mapeado hoje)."
+            );
+        }
+
+        const temPegue = declaracao.caminhoPegue.length === 1;
+        const temSenao = !!declaracao.caminhoSenao && declaracao.caminhoSenao.length > 0;
+        const temFinalmente = !!declaracao.caminhoFinalmente && declaracao.caminhoFinalmente.length > 0;
+
+        const rotuloTenteInicio = this.gerarRotulo('Ltente_inicio');
+        const rotuloTenteFim = this.gerarRotulo('Ltente_fim');
+        const rotuloPegueInicio = this.gerarRotulo('Lpegue_inicio');
+        const rotuloSenaoOuFim = this.gerarRotulo('Ltente_senao');
+        const rotuloFinal = this.gerarRotulo('Ltente_final');
+        const rotuloFinalmenteExcecao = temFinalmente ? this.gerarRotulo('Lfinalmente_excecao') : null;
+
+        this.instrucoes.push(`${rotuloTenteInicio}:`);
+        for (const decl of declaracao.caminhoTente) {
+            await decl.aceitar(this as any);
+        }
+        this.instrucoes.push(`${rotuloTenteFim}:`);
+        this.instrucoes.push(`goto ${rotuloSenaoOuFim}`);
+
+        if (temPegue) {
+            const blocoPegue = declaracao.caminhoPegue[0];
+            this.instrucoes.push(`${rotuloPegueInicio}:`);
+            const slotExcecao = this.reservarSlotTemporario('Ljava/lang/RuntimeException;');
+            this.instrucoes.push(`astore ${slotExcecao}`);
+            if (blocoPegue.parametro) {
+                const slotParametro = this.reservarSlotTemporario('Ljava/lang/String;');
+                this.instrucoes.push(`aload ${slotExcecao}`);
+                this.instrucoes.push('invokevirtual java/lang/RuntimeException/getMessage()Ljava/lang/String;');
+                this.instrucoes.push(`astore ${slotParametro}`);
+                this.variaveis.set(blocoPegue.parametro.lexema, {
+                    slot: slotParametro,
+                    tipoJvm: 'Ljava/lang/String;',
+                    tipoDelegua: 'texto',
+                });
+            }
+            for (const decl of blocoPegue.corpo) {
+                await decl.aceitar(this as any);
+            }
+            this.instrucoes.push(`goto ${rotuloFinal}`);
+            this.catchesGerados.push(`.catch java/lang/RuntimeException from ${rotuloTenteInicio} to ${rotuloTenteFim} using ${rotuloPegueInicio}`);
+        }
+
+        this.instrucoes.push(`${rotuloSenaoOuFim}:`);
+        if (temSenao) {
+            for (const decl of declaracao.caminhoSenao) {
+                await decl.aceitar(this as any);
+            }
+        }
+        this.instrucoes.push(`goto ${rotuloFinal}`);
+
+        if (temFinalmente) {
+            this.instrucoes.push(`${rotuloFinalmenteExcecao}:`);
+            const slotExcecaoRelancar = this.reservarSlotTemporario('Ljava/lang/Throwable;');
+            this.instrucoes.push(`astore ${slotExcecaoRelancar}`);
+            for (const decl of declaracao.caminhoFinalmente) {
+                await decl.aceitar(this as any);
+            }
+            this.instrucoes.push(`aload ${slotExcecaoRelancar}`);
+            this.instrucoes.push('athrow');
+            // Cobre `tente` + `pegue` (nessa ordem no texto): se qualquer um dos dois lançar
+            // algo que não seja pego antes, o `finalmente` roda e a exceção original relança.
+            this.catchesGerados.push(
+                `.catch java/lang/Throwable from ${rotuloTenteInicio} to ${rotuloFinalmenteExcecao} using ${rotuloFinalmenteExcecao}`
+            );
+        }
+
+        this.instrucoes.push(`${rotuloFinal}:`);
+        if (temFinalmente) {
+            for (const decl of declaracao.caminhoFinalmente) {
+                await decl.aceitar(this as any);
+            }
         }
     }
 }

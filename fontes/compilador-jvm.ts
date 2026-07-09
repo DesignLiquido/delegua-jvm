@@ -141,6 +141,52 @@ const RETORNOS_METODOS_TEXTO: Record<string, string> = {
     tudoMinúsculo: 'logico',
 };
 
+// Nomes da biblioteca global (`inicializarPilhaEscopos()` no avaliador sintático) normalizados
+// pra uma chave canônica — várias delas têm uma variante acentuada equivalente.
+const NOMES_CANONICOS_BIBLIOTECA: Record<string, string> = {
+    aleatorio: 'aleatorio',
+    aleatório: 'aleatorio',
+    aleatorioEntre: 'aleatorioEntre',
+    aleatórioEntre: 'aleatorioEntre',
+    algum: 'algum',
+    arredondar: 'arredondar',
+    clonar: 'clonar',
+    encontrar: 'encontrar',
+    encontrarIndice: 'encontrarIndice',
+    encontrarÍndice: 'encontrarIndice',
+    encontrarUltimo: 'encontrarUltimo',
+    encontrarÚltimo: 'encontrarUltimo',
+    encontrarUltimoIndice: 'encontrarUltimoIndice',
+    encontrarÚltimoÍndice: 'encontrarUltimoIndice',
+    filtrarPor: 'filtrarPor',
+    incluido: 'incluido',
+    incluído: 'incluido',
+    inteiro: 'inteiro',
+    longo: 'longo',
+    intervalo: 'intervalo',
+    mapear: 'mapear',
+    maximo: 'maximo',
+    máximo: 'maximo',
+    minimo: 'minimo',
+    mínimo: 'minimo',
+    numero: 'numero',
+    número: 'numero',
+    ordenar: 'ordenar',
+    paraCada: 'paraCada',
+    primeiroEmCondicao: 'primeiroEmCondicao',
+    primeiroEmCondição: 'primeiroEmCondicao',
+    real: 'real',
+    reduzir: 'reduzir',
+    somar: 'somar',
+    tamanho: 'tamanho',
+    texto: 'texto',
+    todos: 'todos',
+    todosEmCondicao: 'todosEmCondicao',
+    todosEmCondição: 'todosEmCondicao',
+    tupla: 'tupla',
+    vetor: 'vetor',
+};
+
 /**
  * Primeira fatia vertical do compilador Delégua → bytecode JVM (texto Jasmin).
  * Suporta apenas: `var` com literais, leitura de variáveis, aritmética
@@ -749,6 +795,16 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             if (!metodo) throw new ErroCompilador(`'${expressao.entidadeChamada.simbolo.lexema}' não é uma função anônima chamável.`);
             return metodo.tipoRetornoDelegua;
         }
+        if (
+            expressao.entidadeChamada instanceof Variavel &&
+            !this.funcoes.has(expressao.entidadeChamada.simbolo.lexema) &&
+            this.nomeCanonicoBiblioteca(expressao.entidadeChamada.simbolo.lexema)
+        ) {
+            return this.resolverTipoRetornoBiblioteca(
+                this.nomeCanonicoBiblioteca(expressao.entidadeChamada.simbolo.lexema)!,
+                expressao.argumentos
+            );
+        }
         return this.resolverInfoFuncaoChamada(expressao).tipoRetornoDelegua;
     }
 
@@ -760,6 +816,87 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             return tipoRetorno;
         }
         throw new ErroCompilador(`Método '${acesso.nomeMetodo}' não implementado para o tipo '${tipoObjeto}'.`);
+    }
+
+    private nomeCanonicoBiblioteca(nome: string): string | null {
+        return NOMES_CANONICOS_BIBLIOTECA[nome] ?? null;
+    }
+
+    // Resolução de tipo sem efeito colateral (não compila nada) — usada quando a chamada
+    // aparece como sub-expressão (ex.: peek de tipo em `var` sem anotação explícita). Só
+    // 'mapear' não cabe aqui: seu tipo de retorno depende do que o callback retorna, e não dá
+    // pra descobrir isso sem compilá-lo — nesse caso força o usuário a anotar o tipo (ver
+    // `compilarChamadaBiblioteca` pra a compilação de verdade).
+    private resolverTipoRetornoBiblioteca(nomeCanonico: string, argumentos: any[]): string {
+        switch (nomeCanonico) {
+            case 'aleatorio':
+            case 'aleatorioEntre':
+            case 'arredondar':
+            case 'real':
+            case 'numero':
+                return 'numero';
+            case 'inteiro':
+            case 'tamanho':
+            case 'encontrarIndice':
+            case 'encontrarUltimoIndice':
+                return 'inteiro';
+            case 'longo':
+                throw new ErroCompilador("'longo' (BigInt) não é suportado — este compilador não modela inteiros de precisão arbitrária.");
+            case 'texto':
+                return 'texto';
+            case 'algum':
+            case 'todos':
+            case 'todosEmCondicao':
+            case 'incluido':
+                return 'logico';
+            case 'clonar':
+                return this.resolverTipoConstruto(argumentos[0]);
+            case 'maximo':
+            case 'minimo':
+            case 'somar': {
+                const tipoVetor = this.resolverTipoConstruto(argumentos[0]);
+                if (!tipoVetor.endsWith('[]')) throw new ErroCompilador(`'${nomeCanonico}' espera um vetor.`);
+                return tipoVetor.slice(0, -2);
+            }
+            case 'ordenar':
+                return this.resolverTipoConstruto(argumentos[0]);
+            case 'intervalo':
+                return 'inteiro[]';
+            case 'vetor': {
+                const tipoTupla = this.resolverTipoConstruto(argumentos[0]);
+                if (!tipoTupla.startsWith('tupla<')) throw new ErroCompilador("'vetor' espera uma tupla.");
+                const tipos = this.dividirTiposTupla(tipoTupla);
+                if (!tipos.every((tipo) => tipo === tipos[0])) {
+                    throw new ErroCompilador("'vetor' só suporta tupla homogênea (todos os elementos do mesmo tipo).");
+                }
+                return `${tipos[0]}[]`;
+            }
+            case 'tupla':
+                throw new ErroCompilador(
+                    "'tupla(vetor)' não é suportado: a aridade de uma tupla precisa ser conhecida em tempo de compilação, e 'vetor' tem tamanho dinâmico."
+                );
+            case 'paraCada':
+                return 'vazio';
+            case 'filtrarPor':
+                return this.resolverTipoConstruto(argumentos[0]);
+            case 'encontrar':
+            case 'encontrarUltimo':
+            case 'primeiroEmCondicao': {
+                const tipoVetor = this.resolverTipoConstruto(argumentos[0]);
+                if (!tipoVetor.endsWith('[]')) throw new ErroCompilador(`'${nomeCanonico}' espera um vetor.`);
+                return tipoVetor.slice(0, -2);
+            }
+            case 'reduzir':
+                return this.resolverTipoConstruto(argumentos[2]);
+            case 'mapear':
+                throw new ErroCompilador(
+                    "'mapear' com função de callback precisa de tipo explícito quando usado como inicializador " +
+                        "(ex.: 'var r: inteiro[] = mapear(...)') — não dá pra descobrir o tipo do resultado sem compilar " +
+                        'a função anônima, e fazer isso aqui a compilaria duas vezes.'
+                );
+            default:
+                throw new ErroCompilador(`Função nativa '${nomeCanonico}' não implementada.`);
+        }
     }
 
     private resolverInfoFuncaoChamada(expressao: Chamada): FuncaoInfo {
@@ -898,6 +1035,9 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
                 break;
             case 'DIVISAO':
                 this.instrucoes.push('ddiv');
+                break;
+            case 'MODULO':
+                this.instrucoes.push(inteiro ? 'irem' : 'drem');
                 break;
             default:
                 throw new ErroCompilador(`Operador '${expressao.operador.lexema}' não implementado.`);
@@ -1212,6 +1352,20 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         // são de fato instanciados pelo parser desta versão — ver PLAN.md).
         if (expressao.entidadeChamada instanceof Variavel && this.variaveis.has(expressao.entidadeChamada.simbolo.lexema)) {
             return await this.compilarChamadaLambda(expressao);
+        }
+
+        // Função nativa da biblioteca global (`mapear`, `tamanho`, `intervalo`, ...) — só entra
+        // aqui se não houver função de nível superior com o mesmo nome (usuário pode "sombrear"
+        // um nome de biblioteca com sua própria função).
+        if (
+            expressao.entidadeChamada instanceof Variavel &&
+            !this.funcoes.has(expressao.entidadeChamada.simbolo.lexema) &&
+            this.nomeCanonicoBiblioteca(expressao.entidadeChamada.simbolo.lexema)
+        ) {
+            return await this.compilarChamadaBiblioteca(
+                this.nomeCanonicoBiblioteca(expressao.entidadeChamada.simbolo.lexema)!,
+                expressao.argumentos
+            );
         }
 
         const info = this.resolverInfoFuncaoChamada(expressao);
@@ -2567,4 +2721,825 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     // `compilar()`). Quando a declaração `importar` chega até aqui, no laço normal de
     // compilação do arquivo principal, não sobra nada a fazer.
     async visitarDeclaracaoImportar(declaracao: Importar): Promise<any> {}
+
+    // ===== Biblioteca global (Fase 10) =====
+    // Cada função é um intrínseco do compilador: gera bytecode direto no call site (sem
+    // `invokestatic` pra um método real em algum lugar), o que é o que permite usar funções
+    // anônimas como callback aqui mesmo com a limitação de tipagem nominal da Fase 7 (o
+    // compilador conhece a classe Lambda concreta bem ali, no site da chamada).
+
+    private instrucaoStore(tipoJvm: string, slot: number): string {
+        if (tipoJvm === 'D') return `dstore ${slot}`;
+        if (this.ehTipoReferencia(tipoJvm)) return `astore ${slot}`;
+        return `istore ${slot}`;
+    }
+
+    private instrucaoLoad(tipoJvm: string, slot: number): string {
+        if (tipoJvm === 'D') return `dload ${slot}`;
+        if (this.ehTipoReferencia(tipoJvm)) return `aload ${slot}`;
+        return `iload ${slot}`;
+    }
+
+    private async compilarChamadaBiblioteca(nomeCanonico: string, argumentos: any[]): Promise<string> {
+        switch (nomeCanonico) {
+            case 'aleatorio':
+                return await this.compilarAleatorio(argumentos);
+            case 'aleatorioEntre':
+                return await this.compilarAleatorioEntre(argumentos);
+            case 'arredondar':
+                return await this.compilarArredondar(argumentos);
+            case 'inteiro':
+                return await this.compilarConverterInteiro(argumentos);
+            case 'numero':
+            case 'real':
+                return await this.compilarConverterNumero(argumentos);
+            case 'texto':
+                return await this.compilarConverterTexto(argumentos);
+            case 'longo':
+                throw new ErroCompilador("'longo' (BigInt) não é suportado — este compilador não modela inteiros de precisão arbitrária.");
+            case 'tamanho':
+                return await this.compilarTamanho(argumentos);
+            case 'maximo':
+                return await this.compilarMaximoOuMinimo(argumentos, true);
+            case 'minimo':
+                return await this.compilarMaximoOuMinimo(argumentos, false);
+            case 'somar':
+                return await this.compilarSomar(argumentos);
+            case 'ordenar':
+                return await this.compilarOrdenar(argumentos);
+            case 'intervalo':
+                return await this.compilarIntervalo(argumentos);
+            case 'incluido':
+                return await this.compilarIncluido(argumentos);
+            case 'clonar':
+                return await this.compilarClonar(argumentos);
+            case 'vetor':
+                return await this.compilarVetorDeTupla(argumentos);
+            case 'tupla':
+                throw new ErroCompilador(
+                    "'tupla(vetor)' não é suportado: a aridade de uma tupla precisa ser conhecida em tempo de compilação, e 'vetor' tem tamanho dinâmico."
+                );
+            case 'mapear':
+                return await this.compilarMapear(argumentos);
+            case 'filtrarPor':
+                return await this.compilarFiltrarPor(argumentos);
+            case 'paraCada':
+                return await this.compilarParaCada(argumentos);
+            case 'algum':
+                return await this.compilarAlgumOuTodosEmCondicao(argumentos, 'algum', true);
+            case 'todosEmCondicao':
+                return await this.compilarAlgumOuTodosEmCondicao(argumentos, 'todosEmCondicao', false);
+            case 'todos':
+                return await this.compilarTodos(argumentos);
+            case 'encontrar':
+                return await this.compilarEncontrar(argumentos, 'encontrar', false);
+            case 'encontrarUltimo':
+                return await this.compilarEncontrar(argumentos, 'encontrarUltimo', true);
+            case 'primeiroEmCondicao':
+                return await this.compilarEncontrar(argumentos, 'primeiroEmCondicao', false);
+            case 'encontrarIndice':
+                return await this.compilarEncontrarIndice(argumentos, 'encontrarIndice', false);
+            case 'encontrarUltimoIndice':
+                return await this.compilarEncontrarIndice(argumentos, 'encontrarUltimoIndice', true);
+            case 'reduzir':
+                return await this.compilarReduzir(argumentos);
+            default:
+                throw new ErroCompilador(`Função nativa '${nomeCanonico}' não implementada.`);
+        }
+    }
+
+    private async compilarAleatorio(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 0) throw new ErroCompilador("'aleatorio' não recebe argumentos.");
+        this.instrucoes.push('invokestatic java/lang/Math/random()D');
+        return 'numero';
+    }
+
+    private async compilarAleatorioEntre(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 2) throw new ErroCompilador("'aleatorioEntre' espera 2 argumentos.");
+        const exigirNumero = async (expressao: any): Promise<void> => {
+            const tipo = await expressao.aceitar(this as any);
+            if (tipo === 'inteiro') this.instrucoes.push('i2d');
+            else if (tipo !== 'numero') throw new ErroCompilador("'aleatorioEntre' espera argumentos inteiro/numero.");
+        };
+
+        const slotMinimo = this.reservarSlotTemporario('D');
+        await exigirNumero(argumentos[0]);
+        this.instrucoes.push(`dstore ${slotMinimo}`);
+        const slotMaximo = this.reservarSlotTemporario('D');
+        await exigirNumero(argumentos[1]);
+        this.instrucoes.push(`dstore ${slotMaximo}`);
+
+        // minimo + Math.random() * (maximo - minimo)
+        this.instrucoes.push(`dload ${slotMinimo}`);
+        this.instrucoes.push('invokestatic java/lang/Math/random()D');
+        this.instrucoes.push(`dload ${slotMaximo}`);
+        this.instrucoes.push(`dload ${slotMinimo}`);
+        this.instrucoes.push('dsub');
+        this.instrucoes.push('dmul');
+        this.instrucoes.push('dadd');
+
+        return 'numero';
+    }
+
+    private async compilarArredondar(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 2) throw new ErroCompilador("'arredondar' espera 2 argumentos.");
+        const tipoNumero = await argumentos[0].aceitar(this as any);
+        if (tipoNumero === 'inteiro') this.instrucoes.push('i2d');
+        else if (tipoNumero !== 'numero') throw new ErroCompilador("'numero' de 'arredondar' precisa ser inteiro/numero.");
+        const slotNumero = this.reservarSlotTemporario('D');
+        this.instrucoes.push(`dstore ${slotNumero}`);
+
+        const tipoCasas = await argumentos[1].aceitar(this as any);
+        if (tipoCasas !== 'inteiro') throw new ErroCompilador("'casasDecimais' de 'arredondar' precisa ser inteiro.");
+        const slotCasas = this.reservarSlotTemporario('I');
+        this.instrucoes.push(`istore ${slotCasas}`);
+
+        const slotMultiplicador = this.reservarSlotTemporario('D');
+        this.instrucoes.push('ldc2_w 10.0');
+        this.instrucoes.push(`iload ${slotCasas}`);
+        this.instrucoes.push('i2d');
+        this.instrucoes.push('invokestatic java/lang/Math/pow(DD)D');
+        this.instrucoes.push(`dstore ${slotMultiplicador}`);
+
+        this.instrucoes.push(`dload ${slotNumero}`);
+        this.instrucoes.push(`dload ${slotMultiplicador}`);
+        this.instrucoes.push('dmul');
+        this.instrucoes.push('invokestatic java/lang/Math/round(D)J');
+        this.instrucoes.push('l2d');
+        this.instrucoes.push(`dload ${slotMultiplicador}`);
+        this.instrucoes.push('ddiv');
+
+        return 'numero';
+    }
+
+    private async compilarConverterInteiro(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 1) throw new ErroCompilador("'inteiro' espera 1 argumento.");
+        const tipoValor = await argumentos[0].aceitar(this as any);
+        switch (tipoValor) {
+            case 'inteiro':
+                break;
+            case 'numero':
+                this.instrucoes.push('d2i');
+                break;
+            case 'texto':
+                this.instrucoes.push('invokestatic java/lang/Integer/parseInt(Ljava/lang/String;)I');
+                break;
+            default:
+                throw new ErroCompilador(`'inteiro' não sabe converter valor de tipo '${tipoValor}'.`);
+        }
+        return 'inteiro';
+    }
+
+    private async compilarConverterNumero(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 1) throw new ErroCompilador("'numero'/'real' espera 1 argumento.");
+        const tipoValor = await argumentos[0].aceitar(this as any);
+        switch (tipoValor) {
+            case 'inteiro':
+                this.instrucoes.push('i2d');
+                break;
+            case 'numero':
+                break;
+            case 'texto':
+                this.instrucoes.push('invokestatic java/lang/Double/parseDouble(Ljava/lang/String;)D');
+                break;
+            default:
+                throw new ErroCompilador(`'numero' não sabe converter valor de tipo '${tipoValor}'.`);
+        }
+        return 'numero';
+    }
+
+    private async compilarConverterTexto(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 1) throw new ErroCompilador("'texto' espera 1 argumento.");
+        const tipoValor = await argumentos[0].aceitar(this as any);
+        if (tipoValor === 'inteiro' || tipoValor === 'numero' || tipoValor === 'logico' || tipoValor === 'texto') {
+            this.converterParaTexto(tipoValor);
+        } else {
+            // Qualquer outra referência (vetor, dicionário, tupla, instância de classe): usa
+            // Object.toString() via String.valueOf(Object) — ArrayList/HashMap já têm toString()
+            // legível; instância de classe do usuário usa o toString() padrão do Object
+            // (endereço/hash), já que não há suporte a sobrescrever toString() aqui.
+            this.instrucoes.push('invokestatic java/lang/String/valueOf(Ljava/lang/Object;)Ljava/lang/String;');
+        }
+        return 'texto';
+    }
+
+    private async compilarTamanho(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 1) throw new ErroCompilador("'tamanho' espera 1 argumento.");
+        const tipoObjeto = this.resolverTipoConstruto(argumentos[0]);
+        if (tipoObjeto.startsWith('tupla<')) {
+            // Aridade da tupla é conhecida em tempo de compilação — nem precisa avaliar a
+            // expressão em si, mas avalia (e descarta) mesmo assim, preservando efeitos colaterais.
+            await this.emitirComoDeclaracaoDeExpressao(argumentos[0]);
+            this.instrucoes.push(`ldc ${this.dividirTiposTupla(tipoObjeto).length}`);
+            return 'inteiro';
+        }
+        await argumentos[0].aceitar(this as any);
+        if (tipoObjeto.endsWith('[]')) {
+            this.instrucoes.push('invokevirtual java/util/ArrayList/size()I');
+        } else if (tipoObjeto === 'texto') {
+            this.instrucoes.push('invokevirtual java/lang/String/length()I');
+        } else if (tipoObjeto.startsWith('dicionario<')) {
+            this.instrucoes.push('invokevirtual java/util/HashMap/size()I');
+        } else {
+            throw new ErroCompilador(`'tamanho' não implementado para o tipo '${tipoObjeto}'.`);
+        }
+        return 'inteiro';
+    }
+
+    private async compilarMaximoOuMinimo(argumentos: any[], maior: boolean): Promise<string> {
+        const nomeFuncao = maior ? 'maximo' : 'minimo';
+        if (argumentos.length !== 1) throw new ErroCompilador(`'${nomeFuncao}' espera 1 argumento.`);
+        const { slotOrigem, tipoElemento, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        if (tipoElemento !== 'inteiro' && tipoElemento !== 'numero') {
+            throw new ErroCompilador(`'${nomeFuncao}' só é suportado em vetor de inteiro/numero (tipo '${tipoElemento}[]' não suportado).`);
+        }
+
+        const slotResultado = this.reservarSlotTemporario(tipoJvmElemento);
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(this.instrucaoStore(tipoJvmElemento, slotResultado));
+        this.instrucoes.push('iconst_1');
+        this.instrucoes.push(`istore ${slotIndice}`);
+
+        const slotElementoAtual = this.reservarSlotTemporario(tipoJvmElemento);
+        const rotuloInicio = this.gerarRotulo(`L${nomeFuncao}_inicio`);
+        const rotuloSemTroca = this.gerarRotulo(`L${nomeFuncao}_sememtroca`);
+        const rotuloFim = this.gerarRotulo(`L${nomeFuncao}_fim`);
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(this.instrucaoStore(tipoJvmElemento, slotElementoAtual));
+
+        if (tipoJvmElemento === 'D') {
+            this.instrucoes.push(`dload ${slotElementoAtual}`);
+            this.instrucoes.push(`dload ${slotResultado}`);
+            this.instrucoes.push('dcmpg');
+            this.instrucoes.push(maior ? `ifle ${rotuloSemTroca}` : `ifge ${rotuloSemTroca}`);
+        } else {
+            this.instrucoes.push(`iload ${slotElementoAtual}`);
+            this.instrucoes.push(`iload ${slotResultado}`);
+            this.instrucoes.push(maior ? `if_icmple ${rotuloSemTroca}` : `if_icmpge ${rotuloSemTroca}`);
+        }
+        this.instrucoes.push(this.instrucaoLoad(tipoJvmElemento, slotElementoAtual));
+        this.instrucoes.push(this.instrucaoStore(tipoJvmElemento, slotResultado));
+        this.instrucoes.push(`${rotuloSemTroca}:`);
+
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(this.instrucaoLoad(tipoJvmElemento, slotResultado));
+
+        return tipoElemento;
+    }
+
+    private async compilarSomar(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 1) throw new ErroCompilador("'somar' espera 1 argumento.");
+        const { slotOrigem, tipoElemento, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        if (tipoElemento !== 'inteiro' && tipoElemento !== 'numero') {
+            throw new ErroCompilador(`'somar' só é suportado em vetor de inteiro/numero (tipo '${tipoElemento}[]' não suportado).`);
+        }
+
+        const slotAcumulador = this.reservarSlotTemporario(tipoJvmElemento);
+        this.instrucoes.push(tipoJvmElemento === 'D' ? 'dconst_0' : 'iconst_0');
+        this.instrucoes.push(this.instrucaoStore(tipoJvmElemento, slotAcumulador));
+
+        const rotuloInicio = this.gerarRotulo('Lsomar_inicio');
+        const rotuloFim = this.gerarRotulo('Lsomar_fim');
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(this.instrucaoLoad(tipoJvmElemento, slotAcumulador));
+        this.instrucoes.push(tipoJvmElemento === 'D' ? 'dadd' : 'iadd');
+        this.instrucoes.push(this.instrucaoStore(tipoJvmElemento, slotAcumulador));
+
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(this.instrucaoLoad(tipoJvmElemento, slotAcumulador));
+
+        return tipoElemento;
+    }
+
+    private async compilarOrdenar(argumentos: any[]): Promise<string> {
+        if (argumentos.length < 1 || argumentos.length > 2) throw new ErroCompilador("'ordenar' espera 1 ou 2 argumentos.");
+        if (argumentos.length === 2) {
+            throw new ErroCompilador("'ordenar' com função de comparação personalizada ainda não é suportado (só ordenação natural).");
+        }
+        const tipoVetor = this.resolverTipoConstruto(argumentos[0]);
+        if (!tipoVetor.endsWith('[]')) throw new ErroCompilador("'ordenar' espera um vetor.");
+        const tipoElemento = tipoVetor.slice(0, -2);
+        if (!['inteiro', 'numero', 'texto', 'logico'].includes(tipoElemento)) {
+            throw new ErroCompilador(`'ordenar' só suporta vetor de inteiro/numero/texto/logico (tipo '${tipoVetor}' não suportado).`);
+        }
+
+        await argumentos[0].aceitar(this as any);
+        this.instrucoes.push('dup');
+        this.instrucoes.push('invokestatic java/util/Collections/sort(Ljava/util/List;)V');
+        // `Collections.sort` ordena em cima da própria lista e não devolve nada — o `dup`
+        // deixou uma segunda cópia da referência na pilha pra servir de "resultado".
+
+        return tipoVetor;
+    }
+
+    private async compilarIntervalo(argumentos: any[]): Promise<string> {
+        if (argumentos.length < 1 || argumentos.length > 3) throw new ErroCompilador("'intervalo' espera de 1 a 3 argumentos.");
+
+        const exigirInteiro = async (expressao: any, nomeArg: string): Promise<void> => {
+            const tipo = await expressao.aceitar(this as any);
+            if (tipo !== 'inteiro') throw new ErroCompilador(`'${nomeArg}' de 'intervalo' precisa ser inteiro.`);
+        };
+
+        const slotInicio = this.reservarSlotTemporario('I');
+        const slotFim = this.reservarSlotTemporario('I');
+        const slotPasso = this.reservarSlotTemporario('I');
+
+        // Convenção adotada (documentada em PLAN.md): 1 argumento = fim (início implícito 0,
+        // igual a Python `range(n)`); 2 = início e fim; 3 = início, fim e passo.
+        if (argumentos.length === 1) {
+            this.instrucoes.push('iconst_0');
+            this.instrucoes.push(`istore ${slotInicio}`);
+            await exigirInteiro(argumentos[0], 'fim');
+            this.instrucoes.push(`istore ${slotFim}`);
+            this.instrucoes.push('iconst_1');
+            this.instrucoes.push(`istore ${slotPasso}`);
+        } else {
+            await exigirInteiro(argumentos[0], 'inicio');
+            this.instrucoes.push(`istore ${slotInicio}`);
+            await exigirInteiro(argumentos[1], 'fim');
+            this.instrucoes.push(`istore ${slotFim}`);
+            if (argumentos.length === 3) {
+                await exigirInteiro(argumentos[2], 'passo');
+                this.instrucoes.push(`istore ${slotPasso}`);
+            } else {
+                this.instrucoes.push('iconst_1');
+                this.instrucoes.push(`istore ${slotPasso}`);
+            }
+        }
+
+        const slotResultado = this.reservarSlotTemporario('Ljava/util/ArrayList;');
+        this.instrucoes.push('new java/util/ArrayList');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('invokespecial java/util/ArrayList/<init>()V');
+        this.instrucoes.push(`astore ${slotResultado}`);
+
+        const slotIndice = this.reservarSlotTemporario('I');
+        this.instrucoes.push(`iload ${slotInicio}`);
+        this.instrucoes.push(`istore ${slotIndice}`);
+
+        const rotuloInicio = this.gerarRotulo('Lintervalo_inicio');
+        const rotuloFim = this.gerarRotulo('Lintervalo_fim');
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotFim}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.instrucoes.push(`aload ${slotResultado}`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.emitirBoxing('I');
+        this.instrucoes.push('invokeinterface java/util/List/add(Ljava/lang/Object;)Z 2');
+        this.instrucoes.push('pop');
+
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotPasso}`);
+        this.instrucoes.push('iadd');
+        this.instrucoes.push(`istore ${slotIndice}`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(`aload ${slotResultado}`);
+
+        return 'inteiro[]';
+    }
+
+    private async compilarIncluido(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 2) throw new ErroCompilador("'incluido' espera 2 argumentos.");
+        const tipoVetor = this.resolverTipoConstruto(argumentos[0]);
+        if (!tipoVetor.endsWith('[]')) throw new ErroCompilador("'incluido' espera um vetor.");
+        const tipoElemento = tipoVetor.slice(0, -2);
+        const tipoJvmElemento = this.mapearTipoJvm(tipoElemento);
+
+        await argumentos[0].aceitar(this as any);
+        const tipoValor = await argumentos[1].aceitar(this as any);
+        if (tipoValor === 'inteiro' && tipoElemento === 'numero') this.instrucoes.push('i2d');
+        this.emitirBoxing(tipoJvmElemento);
+        this.instrucoes.push('invokevirtual java/util/ArrayList/contains(Ljava/lang/Object;)Z');
+        return 'logico';
+    }
+
+    private async compilarClonar(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 1) throw new ErroCompilador("'clonar' espera 1 argumento.");
+        const tipoValor = await argumentos[0].aceitar(this as any);
+        if (tipoValor === 'inteiro' || tipoValor === 'numero' || tipoValor === 'logico' || tipoValor === 'texto') {
+            return tipoValor;
+        }
+        if (tipoValor.endsWith('[]')) {
+            const slotOriginal = this.reservarSlotTemporario('Ljava/util/ArrayList;');
+            this.instrucoes.push(`astore ${slotOriginal}`);
+            this.instrucoes.push('new java/util/ArrayList');
+            this.instrucoes.push('dup');
+            this.instrucoes.push(`aload ${slotOriginal}`);
+            this.instrucoes.push('invokespecial java/util/ArrayList/<init>(Ljava/util/Collection;)V');
+            return tipoValor;
+        }
+        if (tipoValor.startsWith('dicionario<')) {
+            const slotOriginal = this.reservarSlotTemporario('Ljava/util/HashMap;');
+            this.instrucoes.push(`astore ${slotOriginal}`);
+            this.instrucoes.push('new java/util/HashMap');
+            this.instrucoes.push('dup');
+            this.instrucoes.push(`aload ${slotOriginal}`);
+            this.instrucoes.push('invokespecial java/util/HashMap/<init>(Ljava/util/Map;)V');
+            return tipoValor;
+        }
+        if (tipoValor.startsWith('tupla<')) {
+            this.instrucoes.push('checkcast [Ljava/lang/Object;');
+            this.instrucoes.push('invokevirtual [Ljava/lang/Object;/clone()Ljava/lang/Object;');
+            this.instrucoes.push('checkcast [Ljava/lang/Object;');
+            return tipoValor;
+        }
+        throw new ErroCompilador(`'clonar' não suportado para instância de classe (tipo '${tipoValor}') — cópia de objetos do usuário não é suportada.`);
+    }
+
+    private async compilarVetorDeTupla(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 1) throw new ErroCompilador("'vetor' espera 1 argumento.");
+        const tipoTupla = this.resolverTipoConstruto(argumentos[0]);
+        if (!tipoTupla.startsWith('tupla<')) throw new ErroCompilador("'vetor' espera uma tupla.");
+        const tipos = this.dividirTiposTupla(tipoTupla);
+        if (!tipos.every((tipo) => tipo === tipos[0])) {
+            throw new ErroCompilador("'vetor' só suporta tupla homogênea (todos os elementos do mesmo tipo).");
+        }
+
+        this.instrucoes.push('new java/util/ArrayList');
+        this.instrucoes.push('dup');
+        await argumentos[0].aceitar(this as any);
+        this.instrucoes.push('invokestatic java/util/Arrays/asList([Ljava/lang/Object;)Ljava/util/List;');
+        this.instrucoes.push('invokespecial java/util/ArrayList/<init>(Ljava/util/Collection;)V');
+
+        return `${tipos[0]}[]`;
+    }
+
+    // ----- Família com callback (mapear/filtrarPor/paraCada/algum/encontrar*/reduzir/todosEmCondicao) -----
+
+    private async prepararLacoSobreVetor(argVetor: any): Promise<{
+        slotOrigem: number;
+        tipoElemento: string;
+        tipoJvmElemento: string;
+        slotIndice: number;
+        slotTamanho: number;
+    }> {
+        const tipoVetor = this.resolverTipoConstruto(argVetor);
+        if (!tipoVetor.endsWith('[]')) throw new ErroCompilador(`Esperado vetor, tipo '${tipoVetor}' não é iterável.`);
+        const tipoElemento = tipoVetor.slice(0, -2);
+        const tipoJvmElemento = this.mapearTipoJvm(tipoElemento);
+
+        const slotOrigem = this.reservarSlotTemporario('Ljava/util/ArrayList;');
+        await argVetor.aceitar(this as any);
+        this.instrucoes.push(`astore ${slotOrigem}`);
+
+        const slotTamanho = this.reservarSlotTemporario('I');
+        this.instrucoes.push(`aload ${slotOrigem}`);
+        this.instrucoes.push('invokevirtual java/util/ArrayList/size()I');
+        this.instrucoes.push(`istore ${slotTamanho}`);
+
+        const slotIndice = this.reservarSlotTemporario('I');
+        this.instrucoes.push('iconst_0');
+        this.instrucoes.push(`istore ${slotIndice}`);
+
+        return { slotOrigem, tipoElemento, tipoJvmElemento, slotIndice, slotTamanho };
+    }
+
+    private emitirElementoAtual(slotOrigem: number, slotIndice: number, tipoJvmElemento: string): void {
+        this.instrucoes.push(`aload ${slotOrigem}`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push('invokevirtual java/util/ArrayList/get(I)Ljava/lang/Object;');
+        this.emitirUnboxDeObjeto(tipoJvmElemento);
+    }
+
+    private async prepararCallback(
+        argCallback: any,
+        nomeFuncaoOrigem: string,
+        aridadeEsperada: number
+    ): Promise<{ slot: number; metodo: FuncaoInfo; nomeClasse: string }> {
+        const nomeClasse = (await argCallback.aceitar(this as any)) as unknown as string;
+        const infoClasse = this.classes.get(nomeClasse);
+        const metodo = infoClasse?.metodos.get('invocar');
+        if (!metodo) {
+            throw new ErroCompilador(
+                `Argumento de função de '${nomeFuncaoOrigem}' precisa ser uma função anônima (ex.: 'funcao(x) {...}' ou uma variável que guarda uma).`
+            );
+        }
+        if (metodo.parametros.length !== aridadeEsperada) {
+            throw new ErroCompilador(`Função de callback de '${nomeFuncaoOrigem}' precisa receber exatamente ${aridadeEsperada} parâmetro(s).`);
+        }
+        const slot = this.reservarSlotTemporario(this.mapearTipoJvm(nomeClasse));
+        this.instrucoes.push(`astore ${slot}`);
+        return { slot, metodo, nomeClasse };
+    }
+
+    private async compilarMapear(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 2) throw new ErroCompilador("'mapear' espera 2 argumentos.");
+        const { slotOrigem, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        const { slot: slotCallback, metodo, nomeClasse } = await this.prepararCallback(argumentos[1], 'mapear', 1);
+        if (metodo.parametros[0].tipoJvm !== tipoJvmElemento) {
+            throw new ErroCompilador(
+                `Callback de 'mapear' espera parâmetro '${metodo.parametros[0].tipoDelegua}', vetor é de elemento de outro tipo.`
+            );
+        }
+        const tipoJvmResultado = this.mapearTipoJvm(metodo.tipoRetornoDelegua);
+
+        const slotResultado = this.reservarSlotTemporario('Ljava/util/ArrayList;');
+        this.instrucoes.push('new java/util/ArrayList');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('invokespecial java/util/ArrayList/<init>()V');
+        this.instrucoes.push(`astore ${slotResultado}`);
+
+        const rotuloInicio = this.gerarRotulo('Lmapear_inicio');
+        const rotuloFim = this.gerarRotulo('Lmapear_fim');
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.instrucoes.push(`aload ${slotResultado}`);
+        this.instrucoes.push(`aload ${slotCallback}`);
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(`invokevirtual ${nomeClasse}/invocar${metodo.descritor}`);
+        this.emitirBoxing(tipoJvmResultado);
+        this.instrucoes.push('invokeinterface java/util/List/add(Ljava/lang/Object;)Z 2');
+        this.instrucoes.push('pop');
+
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(`aload ${slotResultado}`);
+
+        return `${metodo.tipoRetornoDelegua}[]`;
+    }
+
+    private async compilarFiltrarPor(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 2) throw new ErroCompilador("'filtrarPor' espera 2 argumentos.");
+        const { slotOrigem, tipoElemento, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        const { slot: slotCallback, metodo, nomeClasse } = await this.prepararCallback(argumentos[1], 'filtrarPor', 1);
+        if (metodo.tipoRetornoDelegua !== 'logico') throw new ErroCompilador("Callback de 'filtrarPor' precisa retornar logico.");
+        if (metodo.parametros[0].tipoJvm !== tipoJvmElemento) {
+            throw new ErroCompilador("Callback de 'filtrarPor' espera parâmetro de outro tipo que o do vetor.");
+        }
+
+        const slotResultado = this.reservarSlotTemporario('Ljava/util/ArrayList;');
+        this.instrucoes.push('new java/util/ArrayList');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('invokespecial java/util/ArrayList/<init>()V');
+        this.instrucoes.push(`astore ${slotResultado}`);
+
+        const rotuloInicio = this.gerarRotulo('Lfiltrar_inicio');
+        const rotuloSemAdicionar = this.gerarRotulo('Lfiltrar_semadicionar');
+        const rotuloFim = this.gerarRotulo('Lfiltrar_fim');
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.instrucoes.push(`aload ${slotCallback}`);
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(`invokevirtual ${nomeClasse}/invocar${metodo.descritor}`);
+        this.instrucoes.push(`ifeq ${rotuloSemAdicionar}`);
+
+        this.instrucoes.push(`aload ${slotResultado}`);
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.emitirBoxing(tipoJvmElemento);
+        this.instrucoes.push('invokeinterface java/util/List/add(Ljava/lang/Object;)Z 2');
+        this.instrucoes.push('pop');
+
+        this.instrucoes.push(`${rotuloSemAdicionar}:`);
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(`aload ${slotResultado}`);
+
+        return `${tipoElemento}[]`;
+    }
+
+    private async compilarParaCada(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 2) throw new ErroCompilador("'paraCada' espera 2 argumentos.");
+        const { slotOrigem, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        const { slot: slotCallback, metodo, nomeClasse } = await this.prepararCallback(argumentos[1], 'paraCada', 1);
+        if (metodo.parametros[0].tipoJvm !== tipoJvmElemento) {
+            throw new ErroCompilador("Callback de 'paraCada' espera parâmetro de outro tipo que o do vetor.");
+        }
+
+        const rotuloInicio = this.gerarRotulo('Lparacada_inicio');
+        const rotuloFim = this.gerarRotulo('Lparacada_fim');
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.instrucoes.push(`aload ${slotCallback}`);
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(`invokevirtual ${nomeClasse}/invocar${metodo.descritor}`);
+        if (metodo.tipoRetornoJvm !== 'V') {
+            this.instrucoes.push(metodo.tipoRetornoJvm === 'D' ? 'pop2' : 'pop');
+        }
+
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+
+        return 'vazio';
+    }
+
+    private async compilarAlgumOuTodosEmCondicao(argumentos: any[], nomeFuncao: string, ehAlgum: boolean): Promise<string> {
+        if (argumentos.length !== 2) throw new ErroCompilador(`'${nomeFuncao}' espera 2 argumentos.`);
+        const { slotOrigem, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        const { slot: slotCallback, metodo, nomeClasse } = await this.prepararCallback(argumentos[1], nomeFuncao, 1);
+        if (metodo.tipoRetornoDelegua !== 'logico') throw new ErroCompilador(`Callback de '${nomeFuncao}' precisa retornar logico.`);
+        if (metodo.parametros[0].tipoJvm !== tipoJvmElemento) {
+            throw new ErroCompilador(`Callback de '${nomeFuncao}' espera parâmetro de outro tipo que o do vetor.`);
+        }
+
+        const slotResultado = this.reservarSlotTemporario('Z');
+        this.instrucoes.push(ehAlgum ? 'iconst_0' : 'iconst_1');
+        this.instrucoes.push(`istore ${slotResultado}`);
+
+        const rotuloInicio = this.gerarRotulo(`L${nomeFuncao}_inicio`);
+        const rotuloEncontrado = this.gerarRotulo(`L${nomeFuncao}_encontrado`);
+        const rotuloContinua = this.gerarRotulo(`L${nomeFuncao}_continua`);
+        const rotuloFim = this.gerarRotulo(`L${nomeFuncao}_fim`);
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.instrucoes.push(`aload ${slotCallback}`);
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(`invokevirtual ${nomeClasse}/invocar${metodo.descritor}`);
+        // `algum`: achar 1 verdadeiro já decide o resultado (sai cedo). `todosEmCondicao`: achar
+        // 1 falso já decide (sai cedo). Sem achar nada decisivo, o laço continua.
+        this.instrucoes.push(ehAlgum ? `ifne ${rotuloEncontrado}` : `ifeq ${rotuloEncontrado}`);
+        this.instrucoes.push(`goto ${rotuloContinua}`);
+        this.instrucoes.push(`${rotuloEncontrado}:`);
+        this.instrucoes.push(ehAlgum ? 'iconst_1' : 'iconst_0');
+        this.instrucoes.push(`istore ${slotResultado}`);
+        this.instrucoes.push(`goto ${rotuloFim}`);
+        this.instrucoes.push(`${rotuloContinua}:`);
+
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(`iload ${slotResultado}`);
+
+        return 'logico';
+    }
+
+    private async compilarTodos(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 1) throw new ErroCompilador("'todos' espera 1 argumento.");
+        const { slotOrigem, tipoElemento, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        if (tipoElemento !== 'logico') throw new ErroCompilador(`'todos' só suporta vetor de logico (tipo '${tipoElemento}[]' não suportado).`);
+
+        const slotResultado = this.reservarSlotTemporario('Z');
+        this.instrucoes.push('iconst_1');
+        this.instrucoes.push(`istore ${slotResultado}`);
+
+        const rotuloInicio = this.gerarRotulo('Ltodos_inicio');
+        const rotuloFalso = this.gerarRotulo('Ltodos_falso');
+        const rotuloFim = this.gerarRotulo('Ltodos_fim');
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(`ifeq ${rotuloFalso}`);
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFalso}:`);
+        this.instrucoes.push('iconst_0');
+        this.instrucoes.push(`istore ${slotResultado}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(`iload ${slotResultado}`);
+
+        return 'logico';
+    }
+
+    private async compilarEncontrar(argumentos: any[], nomeFuncao: string, ultimo: boolean): Promise<string> {
+        if (argumentos.length !== 2) throw new ErroCompilador(`'${nomeFuncao}' espera 2 argumentos.`);
+        const { slotOrigem, tipoElemento, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        const { slot: slotCallback, metodo, nomeClasse } = await this.prepararCallback(argumentos[1], nomeFuncao, 1);
+        if (metodo.tipoRetornoDelegua !== 'logico') throw new ErroCompilador(`Callback de '${nomeFuncao}' precisa retornar logico.`);
+        if (metodo.parametros[0].tipoJvm !== tipoJvmElemento) {
+            throw new ErroCompilador(`Callback de '${nomeFuncao}' espera parâmetro de outro tipo que o do vetor.`);
+        }
+
+        const slotResultado = this.reservarSlotTemporario(tipoJvmElemento);
+        this.instrucoes.push(tipoJvmElemento === 'D' ? 'dconst_0' : this.ehTipoReferencia(tipoJvmElemento) ? 'aconst_null' : 'iconst_0');
+        this.instrucoes.push(this.instrucaoStore(tipoJvmElemento, slotResultado));
+
+        const rotuloInicio = this.gerarRotulo(`L${nomeFuncao}_inicio`);
+        const rotuloSemAchar = this.gerarRotulo(`L${nomeFuncao}_semachar`);
+        const rotuloFim = this.gerarRotulo(`L${nomeFuncao}_fim`);
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.instrucoes.push(`aload ${slotCallback}`);
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(`invokevirtual ${nomeClasse}/invocar${metodo.descritor}`);
+        this.instrucoes.push(`ifeq ${rotuloSemAchar}`);
+
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(this.instrucaoStore(tipoJvmElemento, slotResultado));
+        // `encontrar`/`primeiroEmCondicao`: primeiro achado já resolve, sai do laço.
+        // `encontrarUltimo`: continua e vai sobrescrevendo — o último achado sobrevive.
+        if (!ultimo) this.instrucoes.push(`goto ${rotuloFim}`);
+
+        this.instrucoes.push(`${rotuloSemAchar}:`);
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(this.instrucaoLoad(tipoJvmElemento, slotResultado));
+
+        return tipoElemento;
+    }
+
+    private async compilarEncontrarIndice(argumentos: any[], nomeFuncao: string, ultimo: boolean): Promise<string> {
+        if (argumentos.length !== 2) throw new ErroCompilador(`'${nomeFuncao}' espera 2 argumentos.`);
+        const { slotOrigem, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        const { slot: slotCallback, metodo, nomeClasse } = await this.prepararCallback(argumentos[1], nomeFuncao, 1);
+        if (metodo.tipoRetornoDelegua !== 'logico') throw new ErroCompilador(`Callback de '${nomeFuncao}' precisa retornar logico.`);
+        if (metodo.parametros[0].tipoJvm !== tipoJvmElemento) {
+            throw new ErroCompilador(`Callback de '${nomeFuncao}' espera parâmetro de outro tipo que o do vetor.`);
+        }
+
+        const slotResultado = this.reservarSlotTemporario('I');
+        this.instrucoes.push('iconst_m1');
+        this.instrucoes.push(`istore ${slotResultado}`);
+
+        const rotuloInicio = this.gerarRotulo(`L${nomeFuncao}_inicio`);
+        const rotuloSemAchar = this.gerarRotulo(`L${nomeFuncao}_semachar`);
+        const rotuloFim = this.gerarRotulo(`L${nomeFuncao}_fim`);
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.instrucoes.push(`aload ${slotCallback}`);
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(`invokevirtual ${nomeClasse}/invocar${metodo.descritor}`);
+        this.instrucoes.push(`ifeq ${rotuloSemAchar}`);
+
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`istore ${slotResultado}`);
+        if (!ultimo) this.instrucoes.push(`goto ${rotuloFim}`);
+
+        this.instrucoes.push(`${rotuloSemAchar}:`);
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(`iload ${slotResultado}`);
+
+        return 'inteiro';
+    }
+
+    private async compilarReduzir(argumentos: any[]): Promise<string> {
+        if (argumentos.length !== 3) throw new ErroCompilador("'reduzir' espera 3 argumentos (vetor, função, valor inicial).");
+        const { slotOrigem, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(argumentos[0]);
+        const { slot: slotCallback, metodo, nomeClasse } = await this.prepararCallback(argumentos[1], 'reduzir', 2);
+
+        if (metodo.parametros[1].tipoJvm !== tipoJvmElemento) {
+            throw new ErroCompilador("Segundo parâmetro do callback de 'reduzir' espera outro tipo que o do vetor.");
+        }
+        if (metodo.tipoRetornoDelegua !== metodo.parametros[0].tipoDelegua) {
+            throw new ErroCompilador("Callback de 'reduzir' precisa retornar o mesmo tipo do acumulador (primeiro parâmetro).");
+        }
+
+        const tipoJvmAcumulador = metodo.parametros[0].tipoJvm;
+        const tipoValorInicial = await argumentos[2].aceitar(this as any);
+        if (tipoValorInicial === 'inteiro' && metodo.parametros[0].tipoDelegua === 'numero') this.instrucoes.push('i2d');
+        const slotAcumulador = this.reservarSlotTemporario(tipoJvmAcumulador);
+        this.instrucoes.push(this.instrucaoStore(tipoJvmAcumulador, slotAcumulador));
+
+        const rotuloInicio = this.gerarRotulo('Lreduzir_inicio');
+        const rotuloFim = this.gerarRotulo('Lreduzir_fim');
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        this.instrucoes.push(`aload ${slotCallback}`);
+        this.instrucoes.push(this.instrucaoLoad(tipoJvmAcumulador, slotAcumulador));
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(`invokevirtual ${nomeClasse}/invocar${metodo.descritor}`);
+        this.instrucoes.push(this.instrucaoStore(tipoJvmAcumulador, slotAcumulador));
+
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+        this.instrucoes.push(this.instrucaoLoad(tipoJvmAcumulador, slotAcumulador));
+
+        return metodo.tipoRetornoDelegua;
+    }
 }

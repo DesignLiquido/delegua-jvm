@@ -37,7 +37,7 @@ async function principal() {
 
     try {
         console.log('Gerando bytecode JVM (Jasmin)...');
-        const jasmin = await compilador.compilar(codigo, nomeBase);
+        const jasmin = await compilador.compilar(codigo, nomeBase, arquivoEntrada);
         fs.writeFileSync(caminhoJ, jasmin);
         console.log(`Jasmin gerado: ${caminhoJ}`);
 

@@ -25,6 +25,7 @@ import {
     FormatacaoEscrita,
     FuncaoConstruto,
     FuncaoDeclaracao,
+    Importar,
     Isto,
     Lexador,
     Literal,
@@ -42,6 +43,9 @@ import {
     Variavel,
     Vetor,
 } from '@designliquido/delegua';
+
+import * as fs from 'fs';
+import * as path from 'path';
 
 import { ErroCompilador } from './erros/erro-compilador';
 import { VisitanteBaseNaoImplementado } from './visitante-base-nao-implementado';
@@ -168,6 +172,10 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     private proximoIdLambda: number;
     // Diretivas `.catch` (tabela de exceções) do método sendo compilado agora.
     private catchesGerados: string[];
+    // Diretório usado pra resolver caminhos relativos de `importar`; caminhos absolutos de
+    // arquivos já importados (evita reprocessar em ciclos/duplicatas entre módulos).
+    private diretorioBase: string;
+    private arquivosImportados: Set<string>;
 
     constructor() {
         super();
@@ -175,7 +183,12 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.avaliadorSintatico = new AvaliadorSintatico();
     }
 
-    async compilar(codigo: string[], nomeClasse: string = 'Programa'): Promise<string> {
+    // `caminhoArquivo`, se informado, é usado só pra resolver caminhos relativos de `importar`
+    // (o diretório do arquivo vira a base). Sem ele, `importar` relativo resolve contra
+    // `process.cwd()` — suficiente pra código compilado a partir de string em memória (sem
+    // arquivo de verdade), mas quem compila a partir de um arquivo real (`fontes/ilc.ts`) deve
+    // sempre passá-lo.
+    async compilar(codigo: string[], nomeClasse: string = 'Programa', caminhoArquivo?: string): Promise<string> {
         this.instrucoes = [];
         this.variaveis = new Map();
         // Slot 0 é reservado para o parâmetro `String[] args` de `main`.
@@ -192,6 +205,8 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.classesGeradas = new Map();
         this.proximoIdLambda = 0;
         this.catchesGerados = [];
+        this.diretorioBase = caminhoArquivo ? path.dirname(path.resolve(caminhoArquivo)) : process.cwd();
+        this.arquivosImportados = new Set(caminhoArquivo ? [path.resolve(caminhoArquivo)] : []);
 
         const retornoLexador = this.lexador.mapear(codigo, -1);
         const retornoAvaliadorSintatico: any = await this.avaliadorSintatico.analisar(retornoLexador, -1);
@@ -201,23 +216,95 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         // de `declaracoes` (silenciosamente) e só reporta o problema em `erros`. Sem esta
         // checagem, um erro de sintaxe vira bytecode incompleto/incorreto em vez de falhar.
         // Gap real de UX do parser (não do compilador): documentado em PLAN.md.
-        if (retornoAvaliadorSintatico.erros && retornoAvaliadorSintatico.erros.length > 0) {
-            const mensagens = retornoAvaliadorSintatico.erros
-                .map((erro: any) => `linha ${erro.linha}: símbolo '${erro.simbolo?.lexema}' (${erro.codigoDiagnostico})`)
-                .join('; ');
-            throw new ErroCompilador(`Erro de sintaxe: ${mensagens}`);
-        }
+        this.verificarErrosDeParser(retornoAvaliadorSintatico);
+
+        // Resolve `importar` antes de tudo: lê e compila os módulos referenciados (recursivamente),
+        // trazendo suas funções/classes de nível superior pra registro e compilação junto com
+        // o arquivo principal.
+        const declaracoesImportadas = await this.resolverImportacoes(declaracoes, this.diretorioBase);
+        const todasDeclaracoes = [...declaracoesImportadas, ...declaracoes];
 
         // Registrar assinaturas antes de compilar qualquer corpo: permite recursão e chamada
-        // a funções/classes declaradas mais abaixo no arquivo.
-        this.registrarClasses(declaracoes);
-        this.registrarFuncoes(declaracoes);
+        // a funções/classes declaradas mais abaixo no arquivo (ou em outro módulo importado).
+        this.registrarClasses(todasDeclaracoes);
+        this.registrarFuncoes(todasDeclaracoes);
 
-        for (const declaracao of declaracoes) {
+        for (const declaracao of todasDeclaracoes) {
             await declaracao.aceitar(this as any);
         }
 
         return this.montarModulo();
+    }
+
+    private verificarErrosDeParser(resultado: any, origemModulo?: string): void {
+        if (resultado.erros && resultado.erros.length > 0) {
+            const mensagens = resultado.erros
+                .map((erro: any) => `linha ${erro.linha}: símbolo '${erro.simbolo?.lexema}' (${erro.codigoDiagnostico})`)
+                .join('; ');
+            const prefixo = origemModulo ? `Erro de sintaxe no módulo importado '${origemModulo}'` : 'Erro de sintaxe';
+            throw new ErroCompilador(`${prefixo}: ${mensagens}`);
+        }
+    }
+
+    // Lê e compila (lexa/parseia) recursivamente cada `importar { a, b } de "caminho"` de nível
+    // superior, devolvendo as `FuncaoDeclaracao`/`Classe` de nível superior encontradas nos
+    // módulos (dos mais profundos pros mais rasos, pra registro/compilação funcionar em
+    // qualquer ordem de dependência entre eles). Simplificação documentada: expõe TODAS as
+    // funções/classes do módulo, sem filtrar pela lista seletiva de `elementosImportacao` —
+    // filtrar exigiria também rastrear dependências transitivas entre os itens do módulo (uma
+    // classe pode herdar de outra não listada), o que não vale o custo nesta primeira passada.
+    // Outras declarações soltas no topo do módulo (`var`, `escreva`, etc.) são ignoradas —
+    // um módulo importado é tratado como uma biblioteca de funções/classes, não um programa.
+    private async resolverImportacoes(declaracoes: Declaracao[], diretorioBase: string): Promise<Declaracao[]> {
+        const resultado: Declaracao[] = [];
+
+        for (const declaracao of declaracoes) {
+            if (!(declaracao instanceof Importar)) continue;
+
+            if (declaracao.simboloTudo) {
+                throw new ErroCompilador(
+                    "'importar tudo como X de \"...\"' ainda não é suportado — use 'importar { nome1, nome2 } de \"...\"'."
+                );
+            }
+            if (!(declaracao.caminho instanceof Literal) || typeof declaracao.caminho.valor !== 'string') {
+                throw new ErroCompilador("Caminho de 'importar' precisa ser um texto literal.");
+            }
+
+            const caminhoBruto = declaracao.caminho.valor;
+            const nomeArquivo = caminhoBruto.endsWith('.delegua') ? caminhoBruto : `${caminhoBruto}.delegua`;
+            const caminhoAbsoluto = path.resolve(diretorioBase, nomeArquivo);
+
+            // Já resolvido (importado por outro módulo, ou ciclo entre módulos): não reprocessa.
+            if (this.arquivosImportados.has(caminhoAbsoluto)) continue;
+            this.arquivosImportados.add(caminhoAbsoluto);
+
+            if (!fs.existsSync(caminhoAbsoluto)) {
+                throw new ErroCompilador(`Módulo importado não encontrado: '${caminhoAbsoluto}' (de 'importar ... de "${caminhoBruto}"').`);
+            }
+
+            const codigoModulo = fs.readFileSync(caminhoAbsoluto, 'utf-8').split('\n');
+            // Avaliador sintático próprio por módulo: mantém o estado de análise de cada
+            // arquivo (pilha de escopos, tipos definidos em código) isolado do principal.
+            const avaliadorModulo = new AvaliadorSintatico();
+            const retornoLexadorModulo = this.lexador.mapear(codigoModulo, -1);
+            const retornoAvaliadorModulo: any = await avaliadorModulo.analisar(retornoLexadorModulo, -1);
+            this.verificarErrosDeParser(retornoAvaliadorModulo, caminhoAbsoluto);
+
+            const declaracoesModulo = retornoAvaliadorModulo.declaracoes as Declaracao[];
+
+            // Resolve as importações do PRÓPRIO módulo antes das dele, relativas ao diretório
+            // DELE (não ao do arquivo que o importou).
+            const importadasTransitivamente = await this.resolverImportacoes(declaracoesModulo, path.dirname(caminhoAbsoluto));
+            resultado.push(...importadasTransitivamente);
+
+            for (const declaracaoModulo of declaracoesModulo) {
+                if (declaracaoModulo instanceof FuncaoDeclaracao || declaracaoModulo instanceof Classe) {
+                    resultado.push(declaracaoModulo);
+                }
+            }
+        }
+
+        return resultado;
     }
 
     /** Jasmin de cada `classe` Delégua compilada — cada uma é um `.class` próprio, à parte de `Programa`. */
@@ -2474,4 +2561,10 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             }
         }
     }
+
+    // A resolução de verdade (ler o arquivo, parsear, registrar/compilar funções e classes)
+    // já aconteceu antes de qualquer coisa, em `resolverImportacoes` (chamado no início de
+    // `compilar()`). Quando a declaração `importar` chega até aqui, no laço normal de
+    // compilação do arquivo principal, não sobra nada a fazer.
+    async visitarDeclaracaoImportar(declaracao: Importar): Promise<any> {}
 }

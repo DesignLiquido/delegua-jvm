@@ -11,31 +11,44 @@ import {
     AvaliadorSintatico,
     Binario,
     Bloco,
+    Ajuda,
+    AjudaComoConstruto,
     Chamada,
     Classe,
     Continua,
     Declaracao,
     DefinirValor,
     Dicionario,
+    Dupla,
+    Elvis,
     Enquanto,
     Escolha,
     Escreva,
     Expressao,
+    ExpressaoRegular,
+    Extensao,
     Falhar,
     FormatacaoEscrita,
     FuncaoConstruto,
     FuncaoDeclaracao,
     Importar,
+    InterfaceDeclaracao,
     Isto,
+    Leia,
     Lexador,
+    ListaCompreensao,
     Literal,
     Logico,
     Para,
+    ParaCada,
+    ParaCadaComoConstruto,
     Retorna,
     Se,
+    SeTernario,
     Super,
     Sustar,
     Tente,
+    TipoDe,
     Tupla,
     TuplaN,
     Unario,
@@ -103,6 +116,14 @@ interface InfoClasse {
     campos: Map<string, InfoCampo>;
     metodos: Map<string, FuncaoInfo>;
     construtor?: FuncaoInfo;
+}
+
+interface ContextoAcumulacaoParaCada {
+    slotResultado: number;
+    rotuloContinua: string;
+    // Tipo Delégua do primeiro `retorna` encontrado no corpo — vira o tipo de elemento do
+    // vetor resultado. `null` até o primeiro `retorna` ser compilado.
+    tipoElemento: string | null;
 }
 
 const MAPA_TIPOS_JVM: Record<string, string> = {
@@ -222,6 +243,13 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     // arquivos já importados (evita reprocessar em ciclos/duplicatas entre módulos).
     private diretorioBase: string;
     private arquivosImportados: Set<string>;
+    // Pilha de contextos de acumulação de `para cada` usado como expressão (inclusive lista
+    // por compreensão, que é açúcar sintático em cima do mesmo mecanismo): quando não-vazia,
+    // `retorna` dentro do corpo do laço mais interno "produz" pro vetor resultado em vez de
+    // sair do método (ver `visitarExpressaoRetornar`/`visitarExpressaoParaCada`).
+    private pilhaAcumulacaoParaCada: ContextoAcumulacaoParaCada[];
+    // Métodos de `extensao de X { ... }`, por tipo alvo (nome Delégua) e nome de método.
+    private extensoes: Map<string, Map<string, FuncaoInfo>>;
 
     constructor() {
         super();
@@ -253,6 +281,8 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.catchesGerados = [];
         this.diretorioBase = caminhoArquivo ? path.dirname(path.resolve(caminhoArquivo)) : process.cwd();
         this.arquivosImportados = new Set(caminhoArquivo ? [path.resolve(caminhoArquivo)] : []);
+        this.pilhaAcumulacaoParaCada = [];
+        this.extensoes = new Map();
 
         const retornoLexador = this.lexador.mapear(codigo, -1);
         const retornoAvaliadorSintatico: any = await this.avaliadorSintatico.analisar(retornoLexador, -1);
@@ -274,6 +304,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         // a funções/classes declaradas mais abaixo no arquivo (ou em outro módulo importado).
         this.registrarClasses(todasDeclaracoes);
         this.registrarFuncoes(todasDeclaracoes);
+        this.registrarExtensoes(todasDeclaracoes);
 
         for (const declaracao of todasDeclaracoes) {
             await declaracao.aceitar(this as any);
@@ -387,6 +418,50 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             const descritor = `(${parametros.map((parametro) => parametro.tipoJvm).join('')})${tipoRetornoJvm}`;
 
             this.funcoes.set(nomeJvm, { nomeJvm, parametros, tipoRetornoDelegua, tipoRetornoJvm, descritor });
+        }
+    }
+
+    // `extensao de X { metodo(...) { ... } }`: registra cada método num mapa próprio
+    // (`this.extensoes`), separado de `this.classes`/`this.funcoes` — uma extensão não é uma
+    // classe nem uma função de nível superior, é um método "encaixado" num tipo já existente
+    // (primitivo ou classe do usuário). O receptor vira um parâmetro sintético `isto` explícito
+    // (`visitarExpressaoIsto` sabe ler isso — ver o `if (localIsto)` lá).
+    private registrarExtensoes(declaracoes: Declaracao[]): void {
+        const declsExtensao = declaracoes.filter((declaracao): declaracao is Extensao => declaracao instanceof Extensao);
+
+        for (const declaracao of declsExtensao) {
+            const tipoAlvo = this.normalizarTipo(declaracao.simboloTipo.lexema);
+            if (!this.extensoes.has(tipoAlvo)) this.extensoes.set(tipoAlvo, new Map());
+            const metodosDoTipo = this.extensoes.get(tipoAlvo)!;
+
+            for (const metodoDecl of declaracao.metodos) {
+                this.verificarSemDecoradores(metodoDecl, `extensão de ${tipoAlvo}`);
+                const nomeMetodo = metodoDecl.simbolo.lexema;
+                if (metodosDoTipo.has(nomeMetodo)) {
+                    throw new ErroCompilador(`Método de extensão '${nomeMetodo}' já declarado pra '${tipoAlvo}'.`);
+                }
+
+                const tipoJvmReceptor = this.mapearTipoJvm(tipoAlvo);
+                const parametrosUsuario: ParametroFuncao[] = metodoDecl.funcao.parametros.map((parametro) => {
+                    if (!parametro.tipoDado) {
+                        throw new ErroCompilador(`Parâmetro '${parametro.nome.lexema}' de '${tipoAlvo}.${nomeMetodo}' (extensão) precisa de tipo explícito.`);
+                    }
+                    const tipoDelegua = this.normalizarTipo(parametro.tipoDado);
+                    return { nome: parametro.nome.lexema, tipoDelegua, tipoJvm: this.mapearTipoJvm(tipoDelegua) };
+                });
+                const parametros: ParametroFuncao[] = [{ nome: 'isto', tipoDelegua: tipoAlvo, tipoJvm: tipoJvmReceptor }, ...parametrosUsuario];
+
+                const tipoRetornoBruto = metodoDecl.funcao.tipo || 'vazio';
+                if (tipoRetornoBruto === 'qualquer') {
+                    throw new ErroCompilador(`Método de extensão '${tipoAlvo}.${nomeMetodo}' precisa de tipo de retorno explícito.`);
+                }
+                const tipoRetornoDelegua = tipoRetornoBruto === 'vazio' ? 'vazio' : this.normalizarTipo(tipoRetornoBruto);
+                const tipoRetornoJvm = tipoRetornoDelegua === 'vazio' ? 'V' : this.mapearTipoJvm(tipoRetornoDelegua);
+                const descritor = `(${parametros.map((parametro) => parametro.tipoJvm).join('')})${tipoRetornoJvm}`;
+                const nomeJvm = `ext_${tipoAlvo}_${nomeMetodo}`;
+
+                metodosDoTipo.set(nomeMetodo, { nomeJvm, parametros, tipoRetornoDelegua, tipoRetornoJvm, descritor });
+            }
         }
     }
 
@@ -530,6 +605,9 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         return (
             `.class public ${this.nomeClasse}\n` +
             `.super java/lang/Object\n\n` +
+            // Suporte a `leia(...)`: leitor único, criado sob demanda (ver `visitarExpressaoLeia`).
+            // Presente sempre (não custa nada se `leia` nunca for usado).
+            `.field private static leitor Ljava/io/BufferedReader;\n\n` +
             `.method public <init>()V\n` +
             `    aload_0\n` +
             `    invokespecial java/lang/Object/<init>()V\n` +
@@ -566,6 +644,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         if (tipoDelegua.endsWith('[]')) return 'Ljava/util/ArrayList;';
         if (tipoDelegua.startsWith('dicionario<')) return 'Ljava/util/HashMap;';
         if (tipoDelegua.startsWith('tupla<')) return '[Ljava/lang/Object;';
+        if (tipoDelegua === 'expressao_regular') return 'Ljava/util/regex/Pattern;';
         // Não é primitivo nem coleção: só resta ser o nome de uma `classe` já registrada.
         if (this.classes.has(tipoDelegua)) return `L${tipoDelegua};`;
         throw new ErroCompilador(`Tipo '${tipoDelegua}' não implementado para JVM.`);
@@ -654,6 +733,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             if (typeof construto.valor === 'boolean') return 'logico';
             if (typeof construto.valor === 'string') return 'texto';
             if (typeof construto.valor === 'number') return Number.isInteger(construto.valor) ? 'inteiro' : 'numero';
+            if (construto.valor === null) return 'nulo';
             throw new ErroCompilador('Não foi possível deduzir o tipo do literal.');
         }
         if (construto instanceof Variavel) {
@@ -676,6 +756,10 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             return this.resolverTipoConstruto((construto as any).expressao);
         }
         if (construto instanceof Isto) {
+            // Dentro de um método de `extensao`, `isto` é só um parâmetro sintético comum
+            // (não há classe real por trás) — checa isso primeiro.
+            const localIsto = this.variaveis.get('isto');
+            if (localIsto) return localIsto.tipoDelegua;
             if (!this.classeAtual) throw new ErroCompilador("'isto' usado fora de um método de instância.");
             return this.classeAtual.nome;
         }
@@ -730,6 +814,38 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
             const tipoColecao = this.resolverTipoConstruto(construto.entidadeChamada);
             return this.resolverTipoElementoMatriz(tipoColecao);
         }
+        if (construto instanceof Elvis) {
+            const tipoEsquerdo = this.resolverTipoConstruto(construto.esquerda);
+            const tipoDireito = this.resolverTipoConstruto(construto.direita);
+            return tipoEsquerdo !== 'nulo' ? tipoEsquerdo : tipoDireito;
+        }
+        if (construto instanceof Leia) {
+            return 'texto';
+        }
+        if (construto instanceof ExpressaoRegular) {
+            return 'expressao_regular';
+        }
+        // `para cada` como expressão (e lista por compreensão, que é só açúcar sintático em
+        // cima dele — ver `visitarExpressaoListaCompreensao`): o tipo do vetor resultado
+        // depende de compilar o corpo (o tipo de cada `retorna`), igual ao `mapear` da Fase 10
+        // — não dá pra "espiar" sem compilar duas vezes, então exige anotação explícita.
+        if (construto instanceof ListaCompreensao) {
+            return this.resolverTipoConstruto(construto.paraCada);
+        }
+        if (construto instanceof ParaCadaComoConstruto) {
+            throw new ErroCompilador(
+                "'para cada' como expressão precisa de tipo explícito quando usado como inicializador " +
+                    "(ex.: 'var r: inteiro[] = para cada x em v { retorna x }') — não dá pra descobrir o tipo do resultado sem " +
+                    'compilar o corpo, e fazer isso aqui o compilaria duas vezes.'
+            );
+        }
+        if (construto instanceof SeTernario) {
+            const tipoEntao = this.resolverTipoConstruto(construto.expressaoSe);
+            const tipoSenao = this.resolverTipoConstruto(construto.expressaoSenao);
+            if (tipoEntao === tipoSenao) return tipoEntao;
+            if ((tipoEntao === 'inteiro' || tipoEntao === 'numero') && (tipoSenao === 'inteiro' || tipoSenao === 'numero')) return 'numero';
+            throw new ErroCompilador(`'se ternário' com ramos de tipos incompatíveis: '${tipoEntao}' e '${tipoSenao}'.`);
+        }
         throw new ErroCompilador('Não foi possível resolver o tipo da expressão.');
     }
 
@@ -777,10 +893,10 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         if (expressao.entidadeChamada instanceof AcessoMetodoOuPropriedade) {
             const nomeClasseObjeto = this.resolverTipoConstruto(expressao.entidadeChamada.objeto);
             const resolvido = this.buscarMetodoComOrigem(nomeClasseObjeto, expressao.entidadeChamada.simbolo.lexema);
-            if (!resolvido) {
-                throw new ErroCompilador(`Método '${expressao.entidadeChamada.simbolo.lexema}' não encontrado na classe '${nomeClasseObjeto}'.`);
-            }
-            return resolvido.metodo.tipoRetornoDelegua;
+            if (resolvido) return resolvido.metodo.tipoRetornoDelegua;
+            const infoExtensao = this.extensoes.get(nomeClasseObjeto)?.get(expressao.entidadeChamada.simbolo.lexema);
+            if (infoExtensao) return infoExtensao.tipoRetornoDelegua;
+            throw new ErroCompilador(`Método '${expressao.entidadeChamada.simbolo.lexema}' não encontrado na classe '${nomeClasseObjeto}'.`);
         }
         if (expressao.entidadeChamada instanceof AcessoMetodo) {
             return this.resolverTipoRetornoMetodoPrimitivo(expressao.entidadeChamada);
@@ -812,9 +928,17 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         const tipoObjeto = this.resolverTipoConstruto(acesso.objeto);
         if (tipoObjeto === 'texto') {
             const tipoRetorno = RETORNOS_METODOS_TEXTO[acesso.nomeMetodo];
-            if (!tipoRetorno) throw new ErroCompilador(`Método de texto '${acesso.nomeMetodo}' não implementado.`);
-            return tipoRetorno;
+            if (tipoRetorno) return tipoRetorno;
         }
+        // Mesma prioridade de `visitarExpressaoDeChamada`: método real da classe antes de
+        // extensão de mesmo nome (ver comentário lá sobre por que isso pode chegar aqui como
+        // `AcessoMetodo` mesmo sendo uma classe de usuário).
+        if (this.classes.has(tipoObjeto)) {
+            const resolvidoClasse = this.buscarMetodoComOrigem(tipoObjeto, acesso.nomeMetodo);
+            if (resolvidoClasse) return resolvidoClasse.metodo.tipoRetornoDelegua;
+        }
+        const infoExtensao = this.extensoes.get(tipoObjeto)?.get(acesso.nomeMetodo);
+        if (infoExtensao) return infoExtensao.tipoRetornoDelegua;
         throw new ErroCompilador(`Método '${acesso.nomeMetodo}' não implementado para o tipo '${tipoObjeto}'.`);
     }
 
@@ -925,6 +1049,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     }
 
     async visitarDeclaracaoVar(declaracao: Var): Promise<any> {
+        this.verificarSemDecoradores(declaracao, 'var');
         // `declaracao.tipo` é preenchido pelo parser a partir do tipo do inicializador
         // quando não há anotação explícita — e sofre da mesma generalização de
         // 'número' descrita em `resolverTipoConstruto`. Só confia nele quando o
@@ -967,6 +1092,9 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
                 break;
             case 'texto':
                 this.instrucoes.push(`ldc "${this.escaparTexto(expressao.valor as string)}"`);
+                break;
+            case 'nulo':
+                this.instrucoes.push('aconst_null');
                 break;
             default:
                 throw new ErroCompilador(`Literal de tipo '${tipo}' não implementado.`);
@@ -1271,6 +1399,7 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     }
 
     async visitarDeclaracaoDefinicaoFuncao(declaracao: FuncaoDeclaracao): Promise<any> {
+        this.verificarSemDecoradores(declaracao, 'função');
         const info = this.funcoes.get(declaracao.simbolo.lexema);
         if (!info) throw new ErroCompilador(`Função '${declaracao.simbolo.lexema}' não registrada.`);
 
@@ -1339,8 +1468,22 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         if (expressao.entidadeChamada instanceof AcessoMetodo) {
             const acesso = expressao.entidadeChamada;
             const tipoObjeto = this.resolverTipoConstruto(acesso.objeto);
-            if (tipoObjeto === 'texto') {
+            if (tipoObjeto === 'texto' && RETORNOS_METODOS_TEXTO[acesso.nomeMetodo]) {
                 return await this.compilarMetodoTexto(acesso.objeto, acesso.nomeMetodo, expressao.argumentos);
+            }
+            // Achado da Fase 12: registrar uma `extensao de X` faz o PARSER resolver
+            // `objeto.metodo(...)` pra `AcessoMetodo` (não `AcessoMetodoOuPropriedade`) mesmo
+            // quando `X` é uma classe de usuário com um método REAL de mesmo nome (a extensão
+            // entra na mesma tabela `primitivasConhecidas` usada pra texto/número/vetor
+            // nativos). Por isso, se `tipoObjeto` é uma classe registrada, o método real da
+            // classe (com herança) tem que ter prioridade sobre a extensão — mesma ordem de
+            // `compilarChamadaMetodoDeClasse`, reaproveitada aqui.
+            if (this.classes.has(tipoObjeto)) {
+                return await this.compilarChamadaMetodoDeClasse(acesso.objeto, tipoObjeto, acesso.nomeMetodo, expressao.argumentos);
+            }
+            const infoExtensao = this.extensoes.get(tipoObjeto)?.get(acesso.nomeMetodo);
+            if (infoExtensao) {
+                return await this.compilarChamadaExtensao(acesso.objeto, tipoObjeto, infoExtensao, expressao.argumentos);
             }
             throw new ErroCompilador(`Método '${acesso.nomeMetodo}' não implementado para o tipo '${tipoObjeto}'.`);
         }
@@ -1423,18 +1566,30 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
 
     private async compilarChamadaMetodo(expressao: Chamada): Promise<string> {
         const acesso = expressao.entidadeChamada as AcessoMetodoOuPropriedade;
-        const ehSuper = acesso.objeto instanceof Super;
         const nomeClasseObjeto = this.resolverTipoConstruto(acesso.objeto);
-        const resolvido = this.buscarMetodoComOrigem(nomeClasseObjeto, acesso.simbolo.lexema);
+        return await this.compilarChamadaMetodoDeClasse(acesso.objeto, nomeClasseObjeto, acesso.simbolo.lexema, expressao.argumentos);
+    }
+
+    // Compartilhado entre `objeto.metodo(...)` (via `AcessoMetodoOuPropriedade`, o caminho
+    // normal pra classes de usuário) e `AcessoMetodo` quando o objeto acaba sendo uma classe
+    // (ver comentário em `visitarExpressaoDeChamada`) — método real da classe (com herança)
+    // sempre tem prioridade sobre `extensao` de mesmo nome.
+    private async compilarChamadaMetodoDeClasse(objetoExpr: any, nomeClasseObjeto: string, nomeMetodo: string, argumentos: any[]): Promise<string> {
+        const ehSuper = objetoExpr instanceof Super;
+        const resolvido = this.buscarMetodoComOrigem(nomeClasseObjeto, nomeMetodo);
         if (!resolvido) {
-            throw new ErroCompilador(`Método '${acesso.simbolo.lexema}' não encontrado na classe '${nomeClasseObjeto}'.`);
+            const infoExtensao = this.extensoes.get(nomeClasseObjeto)?.get(nomeMetodo);
+            if (infoExtensao) {
+                return await this.compilarChamadaExtensao(objetoExpr, nomeClasseObjeto, infoExtensao, argumentos);
+            }
+            throw new ErroCompilador(`Método '${nomeMetodo}' não encontrado na classe '${nomeClasseObjeto}'.`);
         }
         const { metodo, nomeClasseOrigem } = resolvido;
 
-        if (acesso.objeto instanceof Isto || ehSuper) this.instrucoes.push('aload_0');
-        else await acesso.objeto.aceitar(this as any);
+        if (objetoExpr instanceof Isto || ehSuper) this.instrucoes.push('aload_0');
+        else await objetoExpr.aceitar(this as any);
 
-        await this.compilarArgumentos(expressao.argumentos, metodo.parametros, `${nomeClasseObjeto}.${metodo.nomeJvm}`);
+        await this.compilarArgumentos(argumentos, metodo.parametros, `${nomeClasseObjeto}.${metodo.nomeJvm}`);
 
         // Despacho virtual (`invokevirtual`) deixa a JVM resolver polimorfismo nativamente;
         // `super.metodo(...)` é a exceção deliberada — precisa de `invokespecial` para não
@@ -1443,6 +1598,18 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         const nomeClasseParaInvoke = ehSuper ? nomeClasseOrigem : nomeClasseObjeto;
         this.instrucoes.push(`${instrucaoInvoke} ${nomeClasseParaInvoke}/${metodo.nomeJvm}${metodo.descritor}`);
         return metodo.tipoRetornoDelegua;
+    }
+
+    // Método de `extensao` chamado como `objeto.metodo(args)`: sempre `invokestatic` no
+    // `Programa` (nunca despacho virtual — não é um método real de nenhuma classe), com o
+    // receptor virando o primeiro argumento (`isto` sintético — ver `registrarExtensoes`).
+    private async compilarChamadaExtensao(objetoExpr: any, tipoAlvo: string, info: FuncaoInfo, argumentos: any[]): Promise<string> {
+        if (objetoExpr instanceof Isto || objetoExpr instanceof Super) this.instrucoes.push('aload_0');
+        else await objetoExpr.aceitar(this as any);
+
+        await this.compilarArgumentos(argumentos, info.parametros.slice(1), `${tipoAlvo}.${info.nomeJvm}`);
+        this.instrucoes.push(`invokestatic ${this.nomeClasse}/${info.nomeJvm}${info.descritor}`);
+        return info.tipoRetornoDelegua;
     }
 
     private async compilarChamadaLambda(expressao: Chamada): Promise<string> {
@@ -1462,6 +1629,37 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     }
 
     async visitarExpressaoRetornar(declaracao: Retorna): Promise<any> {
+        // Dentro de um `para cada` usado como EXPRESSÃO (ou de uma lista por compreensão, que
+        // é só açúcar sintático em cima do mesmo mecanismo — ver `visitarExpressaoParaCada`),
+        // `retorna` não sai do método: ele "produz" (acumula no vetor resultado) e continua o
+        // laço. Usa o contexto mais interno (topo da pilha) — cobre `para cada` aninhado.
+        if (this.pilhaAcumulacaoParaCada.length > 0) {
+            const contexto = this.pilhaAcumulacaoParaCada[this.pilhaAcumulacaoParaCada.length - 1];
+            if (!declaracao.valor) {
+                throw new ErroCompilador("'retorna' sem valor dentro de 'para cada' usado como expressão não faz sentido (nada seria acumulado).");
+            }
+            this.instrucoes.push(`aload ${contexto.slotResultado}`);
+            const tipoValor = await declaracao.valor.aceitar(this as any);
+            if (contexto.tipoElemento === null) {
+                contexto.tipoElemento = tipoValor;
+            } else if (contexto.tipoElemento !== tipoValor) {
+                if (contexto.tipoElemento === 'numero' && tipoValor === 'inteiro') {
+                    this.instrucoes.push('i2d');
+                } else {
+                    throw new ErroCompilador(
+                        `'para cada' como expressão: 'retorna' com tipos incompatíveis ('${contexto.tipoElemento}' e '${tipoValor}') — ` +
+                            "todos os 'retorna' do corpo precisam concordar no tipo (a promoção implícita inteiro→numero só funciona se o " +
+                            "primeiro 'retorna' encontrado já for 'numero')."
+                    );
+                }
+            }
+            this.emitirBoxing(this.mapearTipoJvm(contexto.tipoElemento));
+            this.instrucoes.push('invokeinterface java/util/List/add(Ljava/lang/Object;)Z 2');
+            this.instrucoes.push('pop');
+            this.instrucoes.push(`goto ${contexto.rotuloContinua}`);
+            return;
+        }
+
         if (!declaracao.valor) {
             this.instrucoes.push('return');
             return;
@@ -1655,12 +1853,20 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
                     this.instrucoes.push('invokevirtual java/io/PrintStream/println(Ljava/lang/String;)V');
                     break;
                 default:
-                    throw new ErroCompilador(`Não sabe como escrever valor de tipo '${tipo}'.`);
+                    // Qualquer outro tipo referência (vetor, dicionário, tupla, instância de
+                    // classe, expressão regular, função anônima...): usa o overload de
+                    // `println(Object)`, que chama o `toString()` padrão do Java.
+                    if (this.ehTipoReferencia(this.mapearTipoJvm(tipo))) {
+                        this.instrucoes.push('invokevirtual java/io/PrintStream/println(Ljava/lang/Object;)V');
+                    } else {
+                        throw new ErroCompilador(`Não sabe como escrever valor de tipo '${tipo}'.`);
+                    }
             }
         }
     }
 
     async visitarDeclaracaoClasse(declaracao: Classe): Promise<any> {
+        this.verificarSemDecoradores(declaracao, 'classe');
         const info = this.classes.get(declaracao.simbolo.lexema);
         if (!info) throw new ErroCompilador(`Classe '${declaracao.simbolo.lexema}' não registrada.`);
 
@@ -1806,6 +2012,11 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
     }
 
     async visitarExpressaoIsto(expressao: Isto): Promise<string> {
+        const localIsto = this.variaveis.get('isto');
+        if (localIsto) {
+            this.instrucoes.push(this.instrucaoLoad(localIsto.tipoJvm, localIsto.slot));
+            return localIsto.tipoDelegua;
+        }
         if (!this.classeAtual) throw new ErroCompilador("'isto' usado fora de um método de instância.");
         this.instrucoes.push('aload_0');
         return this.classeAtual.nome;
@@ -3541,5 +3752,452 @@ export class CompiladorJvm extends VisitanteBaseNaoImplementado {
         this.instrucoes.push(this.instrucaoLoad(tipoJvmAcumulador, slotAcumulador));
 
         return metodo.tipoRetornoDelegua;
+    }
+
+    // ===== Fase 12 (cauda longa) =====
+
+    // Decoradores (`@nome(...)`): a semântica de referência é Python-style de verdade — o
+    // nome do decorador é resolvido como um valor QUALQUER em tempo de execução (podendo vir
+    // de módulo, ser uma variável dinâmica etc.), chamado com a função/classe alvo e podendo
+    // devolver outra coisa pra SUBSTITUIR o nome original. Isso exige exatamente a abstração
+    // de "valor chamável genérico, independente da classe Lambda concreta" que a Fase 7
+    // deliberadamente não construiu (tipagem nominal por lambda, decisão registrada em
+    // PLAN.md) — não há como fazer isso funcionar aqui sem construir aquela infraestrutura
+    // primeiro. `Decorador.aceitar()` nem passa pelo padrão de visitante (rejeita
+    // incondicionalmente no pacote base) — os decoradores chegam só como um array
+    // `.decoradores` nos campos de outras declarações, então a checagem é proativa.
+    private verificarSemDecoradores(declaracao: { decoradores?: any[] }, tipoDeclaracao: string): void {
+        if (declaracao.decoradores && declaracao.decoradores.length > 0) {
+            throw new ErroCompilador(
+                `Decoradores não são suportados (em ${tipoDeclaracao}) — exigiriam uma abstração de "valor chamável genérico" que a Fase 7 deliberadamente não construiu (ver PLAN.md).`
+            );
+        }
+    }
+
+    // `esquerda ?: direita`: só suportado pra tipos referência (texto/vetor/dicionário/
+    // tupla/classe) — `inteiro`/`numero`/`logico` são primitivos de largura fixa, sem
+    // representação nula neste compilador ("sem tipo dinâmico", mesmo princípio de sempre).
+    // Curto-circuito de verdade (`direita` só é avaliada se `esquerda` for nula) — diferente
+    // do interpretador de referência, que avalia os dois lados sempre.
+    async visitarExpressaoElvis(expressao: Elvis): Promise<string> {
+        const tipoEsquerdo = this.resolverTipoConstruto(expressao.esquerda);
+        const tipoDireito = this.resolverTipoConstruto(expressao.direita);
+
+        if (tipoEsquerdo !== 'nulo' && tipoDireito !== 'nulo' && tipoEsquerdo !== tipoDireito) {
+            throw new ErroCompilador(`Operador elvis ('?:') com tipos incompatíveis: '${tipoEsquerdo}' e '${tipoDireito}'.`);
+        }
+        const tipoResultado = tipoEsquerdo !== 'nulo' ? tipoEsquerdo : tipoDireito;
+        if (tipoResultado === 'nulo') {
+            throw new ErroCompilador("Operador elvis ('?:') com os dois lados nulos não tem tipo resolvível.");
+        }
+        const tipoJvmResultado = this.mapearTipoJvm(tipoResultado);
+        if (!this.ehTipoReferencia(tipoJvmResultado)) {
+            throw new ErroCompilador(
+                `Operador elvis ('?:') só é suportado pra tipos referência (texto/vetor/dicionário/tupla/classe) — '${tipoResultado}' é primitivo, sem representação nula.`
+            );
+        }
+
+        // `esquerda` é sempre nula (ex.: `nulo ?: direita`): `direita` sempre vence, sem
+        // precisar gerar nenhum desvio.
+        if (tipoEsquerdo === 'nulo') {
+            return await expressao.direita.aceitar(this as any);
+        }
+
+        const rotuloNulo = this.gerarRotulo('Lelvis_nulo');
+        const rotuloFim = this.gerarRotulo('Lelvis_fim');
+
+        await expressao.esquerda.aceitar(this as any);
+        this.instrucoes.push('dup');
+        this.instrucoes.push(`ifnull ${rotuloNulo}`);
+        this.instrucoes.push(`goto ${rotuloFim}`);
+        this.instrucoes.push(`${rotuloNulo}:`);
+        this.instrucoes.push('pop');
+        await expressao.direita.aceitar(this as any);
+        this.instrucoes.push(`${rotuloFim}:`);
+
+        return tipoResultado;
+    }
+
+    // `condicao ? expressaoSe : expressaoSenao`: mesma promoção inteiro→numero da aritmética
+    // (`visitarExpressaoBinaria`), só que como desvio de controle de fluxo produzindo valor em
+    // vez de operação aritmética direta — os dois ramos precisam convergir no mesmo tipo JVM
+    // no rótulo final (ponto mais frágil de sempre pra verificador de bytecode, por causa de
+    // stack map frames — mesmo cuidado geral desde a Fase 2).
+    async visitarExpressaoSeTernario(expressao: SeTernario): Promise<string> {
+        const tipoEntao = this.resolverTipoConstruto(expressao.expressaoSe);
+        const tipoSenao = this.resolverTipoConstruto(expressao.expressaoSenao);
+
+        let tipoResultado: string;
+        if (tipoEntao === tipoSenao) {
+            tipoResultado = tipoEntao;
+        } else if ((tipoEntao === 'inteiro' || tipoEntao === 'numero') && (tipoSenao === 'inteiro' || tipoSenao === 'numero')) {
+            tipoResultado = 'numero';
+        } else {
+            throw new ErroCompilador(`'se ternário' com ramos de tipos incompatíveis: '${tipoEntao}' e '${tipoSenao}'.`);
+        }
+
+        const rotuloSenao = this.gerarRotulo('Lternario_senao');
+        const rotuloFim = this.gerarRotulo('Lternario_fim');
+
+        await expressao.condicao.aceitar(this as any);
+        this.instrucoes.push(`ifeq ${rotuloSenao}`);
+        const tipoValorEntao = await expressao.expressaoSe.aceitar(this as any);
+        if (tipoValorEntao === 'inteiro' && tipoResultado === 'numero') this.instrucoes.push('i2d');
+        this.instrucoes.push(`goto ${rotuloFim}`);
+        this.instrucoes.push(`${rotuloSenao}:`);
+        const tipoValorSenao = await expressao.expressaoSenao.aceitar(this as any);
+        if (tipoValorSenao === 'inteiro' && tipoResultado === 'numero') this.instrucoes.push('i2d');
+        this.instrucoes.push(`${rotuloFim}:`);
+
+        return tipoResultado;
+    }
+
+    // Expressão regular (`||/padrao/flags||`): sem nenhum consumidor nativo na biblioteca
+    // (nenhum método de texto aceita isso hoje) — o único uso observável é atribuir a uma
+    // variável. Vira `java.util.regex.Pattern` já compilado; tipo pseudo-Delégua
+    // 'expressao_regular' só existe do lado deste compilador (mapeia pra `Pattern` via
+    // `mapearTipoJvm`).
+    async visitarExpressaoExpressaoRegular(expressao: ExpressaoRegular): Promise<string> {
+        const { padrao, flags } = this.dividirExpressaoRegular(expressao.valor as string);
+        this.instrucoes.push(`ldc "${this.escaparTexto(padrao)}"`);
+        const flagsJava = this.converterFlagsRegexParaJava(flags);
+        if (flagsJava === 0) {
+            this.instrucoes.push('invokestatic java/util/regex/Pattern/compile(Ljava/lang/String;)Ljava/util/regex/Pattern;');
+        } else {
+            this.instrucoes.push(`ldc ${flagsJava}`);
+            this.instrucoes.push('invokestatic java/util/regex/Pattern/compile(Ljava/lang/String;I)Ljava/util/regex/Pattern;');
+        }
+        return 'expressao_regular';
+    }
+
+    private dividirExpressaoRegular(valor: string): { padrao: string; flags: string } {
+        // Formato usual: `/padrao/flags` (delimitador `/`, mas o léxico aceita outros:
+        // `~ @ ; % # '`) — se não bater esse formato, trata o valor bruto todo como padrão.
+        const casamento = /^([/~@;%#'])(.*)\1([a-zA-Z]*)$/.exec(valor);
+        if (casamento) return { padrao: casamento[2], flags: casamento[3] };
+        return { padrao: valor, flags: '' };
+    }
+
+    private converterFlagsRegexParaJava(flags: string): number {
+        let resultado = 0;
+        for (const flag of flags) {
+            switch (flag) {
+                case 'i':
+                    resultado |= 2; // Pattern.CASE_INSENSITIVE
+                    break;
+                case 'm':
+                    resultado |= 8; // Pattern.MULTILINE
+                    break;
+                case 's':
+                    resultado |= 32; // Pattern.DOTALL
+                    break;
+                case 'u':
+                    resultado |= 64; // Pattern.UNICODE_CASE
+                    break;
+                // 'g' (global) e 'y' (sticky) são semântica de iteração/lastIndex do JS, sem
+                // equivalente como flag de compilação em `java.util.regex.Pattern` — ignoradas.
+            }
+        }
+        return resultado;
+    }
+
+    // `para cada <var> em <vetorOuDicionario> { ... }` (declaração) — reaproveitado também
+    // por `para cada` como expressão (`visitarExpressaoParaCada`) e lista por compreensão
+    // (`visitarExpressaoListaCompreensao`), que só diferem por injetar um contexto de
+    // acumulação (ver `pilhaAcumulacaoParaCada`) e um rótulo de "continua" externo.
+    async visitarDeclaracaoParaCada(declaracao: ParaCada): Promise<any> {
+        await this.compilarParaCadaGenerico(declaracao.variavelIteracao, declaracao.vetorOuDicionario, declaracao.corpo.declaracoes);
+    }
+
+    async visitarExpressaoParaCada(expressao: ParaCadaComoConstruto): Promise<string> {
+        const slotResultado = this.reservarSlotTemporario('Ljava/util/ArrayList;');
+        this.instrucoes.push('new java/util/ArrayList');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('invokespecial java/util/ArrayList/<init>()V');
+        this.instrucoes.push(`astore ${slotResultado}`);
+
+        const rotuloContinua = this.gerarRotulo('Lparacadaexpr_continua');
+        const contexto: ContextoAcumulacaoParaCada = { slotResultado, rotuloContinua, tipoElemento: null };
+        this.pilhaAcumulacaoParaCada.push(contexto);
+        try {
+            await this.compilarParaCadaGenerico(expressao.variavelIteracao, expressao.vetorOuDicionario, expressao.corpo.declaracoes, rotuloContinua);
+        } finally {
+            this.pilhaAcumulacaoParaCada.pop();
+        }
+
+        if (!contexto.tipoElemento) {
+            throw new ErroCompilador("'para cada' como expressão precisa de ao menos um 'retorna' no corpo pra saber o tipo do vetor resultante.");
+        }
+        this.instrucoes.push(`aload ${slotResultado}`);
+        return `${contexto.tipoElemento}[]`;
+    }
+
+    // `[expressaoRetorno para cada var em vetor (se condicao)]`: o próprio parser já monta
+    // isso inteiramente como um `ParaCadaComoConstruto` cujo corpo é `se (condicao) { retorna
+    // expressaoRetorno }` (ou só `retorna expressaoRetorno` sem filtro) — então só delega pro
+    // mesmo mecanismo de `para cada` como expressão, sem nenhuma lógica extra aqui.
+    async visitarExpressaoListaCompreensao(expressao: ListaCompreensao): Promise<string> {
+        return await expressao.paraCada.aceitar(this as any);
+    }
+
+    private async compilarParaCadaGenerico(
+        variavelIteracao: any,
+        vetorOuDicionario: any,
+        corpoDeclaracoes: Declaracao[],
+        rotuloContinuaExterno?: string
+    ): Promise<void> {
+        const tipoIteravel = this.resolverTipoConstruto(vetorOuDicionario);
+        if (tipoIteravel.endsWith('[]')) {
+            await this.compilarParaCadaVetor(variavelIteracao, vetorOuDicionario, corpoDeclaracoes, rotuloContinuaExterno);
+        } else if (tipoIteravel.startsWith('dicionario<')) {
+            await this.compilarParaCadaDicionario(variavelIteracao, vetorOuDicionario, tipoIteravel, corpoDeclaracoes, rotuloContinuaExterno);
+        } else {
+            throw new ErroCompilador(`'para cada' não suporta iterar sobre tipo '${tipoIteravel}' (só vetor e dicionário).`);
+        }
+    }
+
+    private async compilarParaCadaVetor(
+        variavelIteracao: any,
+        vetorExpr: any,
+        corpoDeclaracoes: Declaracao[],
+        rotuloContinuaExterno?: string
+    ): Promise<void> {
+        if (!(variavelIteracao instanceof Variavel)) {
+            throw new ErroCompilador("'para cada' sobre vetor espera uma única variável de iteração (não '{chave, valor}', que é só para dicionário).");
+        }
+
+        const { slotOrigem, tipoElemento, tipoJvmElemento, slotIndice, slotTamanho } = await this.prepararLacoSobreVetor(vetorExpr);
+
+        const rotuloInicio = this.gerarRotulo('Lparacada_inicio');
+        const rotuloContinua = rotuloContinuaExterno ?? this.gerarRotulo('Lparacada_continua');
+        const rotuloFim = this.gerarRotulo('Lparacada_fim');
+
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`iload ${slotIndice}`);
+        this.instrucoes.push(`iload ${slotTamanho}`);
+        this.instrucoes.push(`if_icmpge ${rotuloFim}`);
+
+        const slotVariavel = this.reservarSlotTemporario(tipoJvmElemento);
+        this.emitirElementoAtual(slotOrigem, slotIndice, tipoJvmElemento);
+        this.instrucoes.push(this.instrucaoStore(tipoJvmElemento, slotVariavel));
+        this.variaveis.set(variavelIteracao.simbolo.lexema, { slot: slotVariavel, tipoJvm: tipoJvmElemento, tipoDelegua: tipoElemento });
+
+        this.pilhaContinua.push(rotuloContinua);
+        this.pilhaSustar.push(rotuloFim);
+        for (const decl of corpoDeclaracoes) {
+            await decl.aceitar(this as any);
+        }
+        this.pilhaContinua.pop();
+        this.pilhaSustar.pop();
+
+        this.instrucoes.push(`${rotuloContinua}:`);
+        this.instrucoes.push(`iinc ${slotIndice} 1`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+    }
+
+    private async compilarParaCadaDicionario(
+        variavelIteracao: any,
+        dicExpr: any,
+        tipoDicionario: string,
+        corpoDeclaracoes: Declaracao[],
+        rotuloContinuaExterno?: string
+    ): Promise<void> {
+        if (!(variavelIteracao instanceof Dupla)) {
+            throw new ErroCompilador("'para cada' sobre dicionário espera '{chave, valor}' como variável de iteração.");
+        }
+        // O parser guarda os NOMES das duas variáveis de ligação como `Literal`s de texto em
+        // `.primeiro`/`.segundo` (não uma chave/valor de verdade) — achado confirmado
+        // empiricamente antes de implementar, documentado em PLAN.md.
+        const nomeChave = (variavelIteracao.primeiro as Literal).valor as string;
+        const nomeValor = (variavelIteracao.segundo as Literal).valor as string;
+        const tipoValor = tipoDicionario.slice('dicionario<'.length, -1);
+        const tipoJvmValor = this.mapearTipoJvm(tipoValor);
+
+        const slotOrigem = this.reservarSlotTemporario('Ljava/util/HashMap;');
+        await dicExpr.aceitar(this as any);
+        this.instrucoes.push(`astore ${slotOrigem}`);
+
+        const slotIterador = this.reservarSlotTemporario('Ljava/util/Iterator;');
+        this.instrucoes.push(`aload ${slotOrigem}`);
+        this.instrucoes.push('invokevirtual java/util/HashMap/entrySet()Ljava/util/Set;');
+        this.instrucoes.push('invokeinterface java/util/Set/iterator()Ljava/util/Iterator; 1');
+        this.instrucoes.push(`astore ${slotIterador}`);
+
+        const rotuloInicio = this.gerarRotulo('Lparacada_inicio');
+        const rotuloContinua = rotuloContinuaExterno ?? this.gerarRotulo('Lparacada_continua');
+        const rotuloFim = this.gerarRotulo('Lparacada_fim');
+
+        this.instrucoes.push(`${rotuloInicio}:`);
+        this.instrucoes.push(`aload ${slotIterador}`);
+        this.instrucoes.push('invokeinterface java/util/Iterator/hasNext()Z 1');
+        this.instrucoes.push(`ifeq ${rotuloFim}`);
+
+        const slotEntry = this.reservarSlotTemporario('Ljava/util/Map$Entry;');
+        this.instrucoes.push(`aload ${slotIterador}`);
+        this.instrucoes.push('invokeinterface java/util/Iterator/next()Ljava/lang/Object; 1');
+        this.instrucoes.push('checkcast java/util/Map$Entry');
+        this.instrucoes.push(`astore ${slotEntry}`);
+
+        const slotChave = this.reservarSlotTemporario('Ljava/lang/String;');
+        this.instrucoes.push(`aload ${slotEntry}`);
+        this.instrucoes.push('invokeinterface java/util/Map$Entry/getKey()Ljava/lang/Object; 1');
+        this.instrucoes.push('checkcast java/lang/String');
+        this.instrucoes.push(`astore ${slotChave}`);
+
+        const slotValor = this.reservarSlotTemporario(tipoJvmValor);
+        this.instrucoes.push(`aload ${slotEntry}`);
+        this.instrucoes.push('invokeinterface java/util/Map$Entry/getValue()Ljava/lang/Object; 1');
+        this.emitirUnboxDeObjeto(tipoJvmValor);
+        this.instrucoes.push(this.instrucaoStore(tipoJvmValor, slotValor));
+
+        this.variaveis.set(nomeChave, { slot: slotChave, tipoJvm: 'Ljava/lang/String;', tipoDelegua: 'texto' });
+        this.variaveis.set(nomeValor, { slot: slotValor, tipoJvm: tipoJvmValor, tipoDelegua: tipoValor });
+
+        this.pilhaContinua.push(rotuloContinua);
+        this.pilhaSustar.push(rotuloFim);
+        for (const decl of corpoDeclaracoes) {
+            await decl.aceitar(this as any);
+        }
+        this.pilhaContinua.pop();
+        this.pilhaSustar.pop();
+
+        this.instrucoes.push(`${rotuloContinua}:`);
+        this.instrucoes.push(`goto ${rotuloInicio}`);
+        this.instrucoes.push(`${rotuloFim}:`);
+    }
+
+    // `leia()`/`leia("prompt: ")`: lê uma linha da entrada padrão, sempre como `texto` (mesma
+    // convenção do interpretador de referência). Usa um único `BufferedReader` estático,
+    // criado sob demanda na primeira chamada (evita reembrulhar `System.in` a cada `leia()`).
+    async visitarExpressaoLeia(expressao: Leia): Promise<string> {
+        if (expressao.argumentos.length > 1) throw new ErroCompilador("'leia' aceita no máximo 1 argumento (o texto do prompt).");
+
+        if (expressao.argumentos.length === 1) {
+            this.instrucoes.push('getstatic java/lang/System/out Ljava/io/PrintStream;');
+            const tipoPrompt = await expressao.argumentos[0].aceitar(this as any);
+            if (tipoPrompt !== 'texto') throw new ErroCompilador("Prompt de 'leia' precisa ser texto.");
+            this.instrucoes.push('invokevirtual java/io/PrintStream/print(Ljava/lang/String;)V');
+        }
+
+        const rotuloJaInicializado = this.gerarRotulo('Lleia_inicializado');
+        this.instrucoes.push(`getstatic ${this.nomeClasse}/leitor Ljava/io/BufferedReader;`);
+        this.instrucoes.push(`ifnonnull ${rotuloJaInicializado}`);
+        this.instrucoes.push('new java/io/BufferedReader');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('new java/io/InputStreamReader');
+        this.instrucoes.push('dup');
+        this.instrucoes.push('getstatic java/lang/System/in Ljava/io/InputStream;');
+        this.instrucoes.push('invokespecial java/io/InputStreamReader/<init>(Ljava/io/InputStream;)V');
+        this.instrucoes.push('invokespecial java/io/BufferedReader/<init>(Ljava/io/Reader;)V');
+        this.instrucoes.push(`putstatic ${this.nomeClasse}/leitor Ljava/io/BufferedReader;`);
+        this.instrucoes.push(`${rotuloJaInicializado}:`);
+
+        this.instrucoes.push(`getstatic ${this.nomeClasse}/leitor Ljava/io/BufferedReader;`);
+        this.instrucoes.push('invokevirtual java/io/BufferedReader/readLine()Ljava/lang/String;');
+
+        return 'texto';
+    }
+
+    // `tipo de <expressao>`: como este compilador é estaticamente tipado (o tipo já é
+    // conhecido em tempo de compilação), isso vira uma constante de texto — bem mais simples
+    // que o interpretador, que resolve dinamicamente via reflexão em cima do valor real.
+    async visitarExpressaoTipoDe(expressao: TipoDe): Promise<string> {
+        const tipoDelegua = this.resolverTipoConstruto(expressao.valor);
+        this.instrucoes.push(`ldc "${this.formatarNomeTipoParaSaida(tipoDelegua)}"`);
+        return 'texto';
+    }
+
+    private formatarNomeTipoParaSaida(tipo: string): string {
+        if (tipo === 'numero') return 'número';
+        if (tipo === 'logico') return 'lógico';
+        if (tipo.endsWith('[]')) return 'vetor';
+        if (tipo.startsWith('dicionario<')) return 'dicionário';
+        if (tipo.startsWith('tupla<')) return 'tupla';
+        return tipo; // inteiro, texto, vazio, nome de classe (inclusive Lambda gerada)
+    }
+
+    // `interface`: o próprio parser já valida `implementa X` em tempo de análise sintática
+    // (erro de compilação se a classe não cumprir o contrato) — a declaração da interface em
+    // si não carrega nenhum comportamento em tempo de execução, igual ao interpretador de
+    // referência (`visitarDeclaracaoInterface` lá também é um no-op).
+    async visitarDeclaracaoInterface(declaracao: InterfaceDeclaracao): Promise<any> {}
+
+    // `extensao de X { metodo(...) { ... } }`: cada método já foi registrado (assinatura) em
+    // `registrarExtensoes`; aqui só falta compilar os corpos e empilhar em `metodosGerados`
+    // (mesma lista das funções de nível superior — extensão não tem `.class` próprio).
+    async visitarDeclaracaoExtensao(declaracao: Extensao): Promise<any> {
+        // `extensão global` vs `extensão` (só do arquivo) é uma distinção de escopo por
+        // arquivo que não existe neste compilador (tudo é inlinado numa única compilação
+        // desde a Fase 9) — tratadas de forma idêntica. Simplificação documentada em PLAN.md.
+        const tipoAlvo = this.normalizarTipo(declaracao.simboloTipo.lexema);
+        const metodosDoTipo = this.extensoes.get(tipoAlvo);
+        if (!metodosDoTipo) throw new ErroCompilador(`Extensão de '${tipoAlvo}' não registrada.`);
+
+        for (const metodoDecl of declaracao.metodos) {
+            const info = metodosDoTipo.get(metodoDecl.simbolo.lexema);
+            if (!info) throw new ErroCompilador(`Método de extensão '${metodoDecl.simbolo.lexema}' não registrado pra '${tipoAlvo}'.`);
+            this.metodosGerados.push(await this.compilarMetodoExtensao(metodoDecl, info));
+        }
+    }
+
+    private async compilarMetodoExtensao(metodoDecl: FuncaoDeclaracao, info: FuncaoInfo): Promise<string> {
+        const instrucoesAnteriores = this.instrucoes;
+        const variaveisAnteriores = this.variaveis;
+        const slotAnterior = this.proximoSlot;
+        const tipoRetornoAnterior = this.tipoRetornoAtual;
+        const classeAnterior = this.classeAtual;
+        const catchesAnteriores = this.catchesGerados;
+
+        this.instrucoes = [];
+        this.variaveis = new Map();
+        this.proximoSlot = 0;
+        this.tipoRetornoAtual = info.tipoRetornoDelegua;
+        this.classeAtual = null; // não é método de classe real — `isto` resolve via parâmetro sintético.
+        this.catchesGerados = [];
+
+        for (const parametro of info.parametros) {
+            const slot = this.proximoSlot;
+            this.proximoSlot += parametro.tipoJvm === 'D' ? 2 : 1;
+            this.variaveis.set(parametro.nome, { slot, tipoJvm: parametro.tipoJvm, tipoDelegua: parametro.tipoDelegua });
+        }
+
+        for (const decl of metodoDecl.funcao.corpo) {
+            await decl.aceitar(this as any);
+        }
+        if (info.tipoRetornoJvm === 'V') this.instrucoes.push('return');
+
+        const corpoTexto = this.instrucoes.map((instrucao) => `        ${instrucao}`).join('\n');
+        const resultado =
+            `.method private static ${info.nomeJvm}${info.descritor}\n` +
+            `    .limit stack 32\n` +
+            `    .limit locals ${this.proximoSlot}\n` +
+            this.formatarCatches() +
+            (corpoTexto ? corpoTexto + '\n' : '') +
+            `.end method\n`;
+
+        this.instrucoes = instrucoesAnteriores;
+        this.variaveis = variaveisAnteriores;
+        this.proximoSlot = slotAnterior;
+        this.tipoRetornoAtual = tipoRetornoAnterior;
+        this.classeAtual = classeAnterior;
+        this.catchesGerados = catchesAnteriores;
+
+        return resultado;
+    }
+
+    // `ajuda`/`ajuda(...)`: recurso de documentação/REPL — a implementação de referência
+    // despacha em cima do TIPO EM TEMPO DE EXECUÇÃO do valor avaliado (`DeleguaFuncao`,
+    // `ObjetoDeleguaClasse`, `DescritorTipoClasse`, objetos reificados que só existem no
+    // interpretador de árvore). Este compilador não gera nenhum desses objetos — funções
+    // viram métodos estáticos da JVM sem metadado Delégua-side, classes viram `.class` de
+    // verdade sem um "descritor" navegável — então não há como replicar o despacho dinâmico.
+    // Fora de escopo pra compilação AOT.
+    async visitarDeclaracaoAjuda(declaracao: Ajuda): Promise<any> {
+        throw new ErroCompilador("'ajuda' é um recurso de documentação/REPL sem equivalente em compilação AOT — não suportado.");
+    }
+
+    async visitarExpressaoAjuda(expressao: AjudaComoConstruto): Promise<any> {
+        throw new ErroCompilador("'ajuda' é um recurso de documentação/REPL sem equivalente em compilação AOT — não suportado.");
     }
 }
